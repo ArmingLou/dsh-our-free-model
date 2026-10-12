@@ -29410,7 +29410,7 @@ import { ReasoningEffortId, ToolCallId } from "@deepseek-ai/dsh-llm";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 
 // vendor/channel-pack/src/channel-pack-store.ts
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync as chmodSync25, closeSync as closeSync25, constants as fsConstants25, existsSync, lstatSync as lstatSync25, mkdirSync, openSync as openSync25, readFileSync, renameSync, writeFileSync, writeSync as writeSync25 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import Schema from "@deepseek-ai/schemastery";
@@ -32520,12 +32520,118 @@ function errorDetail(body) {
   }
   return body;
 }
+const CODEARTS_FAILURE_LOG_PATH = "/tmp/codearts-403.log";
+function appendCodeartsFailureLog(line) {
+  const payload = `${line}\n`;
+  let fd = null;
+  try {
+    let existing;
+    try {
+      existing = lstatSync25(CODEARTS_FAILURE_LOG_PATH);
+    } catch {
+      existing = void 0;
+    }
+    if (existing?.isSymbolicLink()) return;
+    const noFollow = typeof fsConstants25.O_NOFOLLOW === "number" ? fsConstants25.O_NOFOLLOW : 0;
+    if (existing === void 0) {
+      try {
+        fd = openSync25(CODEARTS_FAILURE_LOG_PATH, fsConstants25.O_WRONLY | fsConstants25.O_CREAT | fsConstants25.O_EXCL | noFollow, 384);
+      } catch {
+        fd = null;
+      }
+    }
+    if (fd === null) {
+      chmodSync25(CODEARTS_FAILURE_LOG_PATH, 384);
+      fd = openSync25(CODEARTS_FAILURE_LOG_PATH, fsConstants25.O_WRONLY | fsConstants25.O_APPEND | noFollow);
+    }
+  } catch {
+    return;
+  }
+  if (fd === null) return;
+  try {
+    writeSync25(fd, payload);
+  } catch {
+  }
+  try {
+    closeSync25(fd);
+  } catch {
+  }
+}
+function isApigAuthBody(body) {
+  if (typeof body !== "string") return false;
+  return body.includes("APIG.0301") || body.includes("APIG.0602") || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body);
+}
+function isDiagnosticToken(token) {
+  if (/[a-z][a-z0-9+.-]*:\/\//i.test(token)) return true;
+  const host = token.replace(/^\/+/, "").split(/[/?#]/)[0]?.split(":")[0] ?? "";
+  const labels = host.split(".");
+  if (labels.length >= 2 && /^[A-Za-z]/.test(labels[0] ?? "") && labels.every(label => /^[A-Za-z0-9-]{1,63}$/.test(label)) && /^[A-Za-z]{2,24}$/.test(labels[labels.length - 1] ?? "")) return true;
+  if (/^[A-Za-z][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+){2,}$/.test(token) && token.split(".").every(segment => segment.length <= 20)) return true;
+  return false;
+}
+function shouldRedactLongToken(token) {
+  if (isDiagnosticToken(token)) return false;
+  if (token.length >= 32) return true;
+  if (/[A-Za-z]/.test(token) && /[0-9]/.test(token)) return true;
+  return /^[A-Za-z0-9+/=_-]+$/.test(token) && /[a-z][A-Z]/.test(token);
+}
+function redactCredentialLike(line) {
+  return line.replace(/\b(bearer)\s+[\w\-._~+/=]+/gi, "$1 <redacted>").replace(/\beyJ[\w-]{4,}\.[\w-]+(?:\.[\w-]*)?/g, "<redacted-jwt>").replace(/\b(?:AKIA|ASIA|AGPA|AIDA)[0-9A-Z]{8,}\b/g, "<redacted-ak>").replace(/\b((?:x-)?(?:security[_-]?token|access[_-]?key[_-]?id|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|signature|authorization|credential|password|passwd)\s*[=:]\s*)["']?[^\s"',;}\]]+["']?/gi, "$1<redacted>").replace(/\b(token|secret|signature|credential|password)\b(\s+(?:is\s+)?(?:expired|invalid|revoked)\s*[::]\s*)["']?[^\s"',;}\]]+["']?/gi, "$1$2<redacted>");
+}
+function redactLongTokens(line) {
+  return line.replace(/[A-Za-z0-9+/._-]{20,}/g, token => shouldRedactLongToken(token) ? "<redacted-longtoken>" : token);
+}
+function safeUpstreamErrorDetail(body) {
+  if (typeof body !== "string") return "";
+  const text = body.trim();
+  if (text.length === 0) return "";
+  const diagnosticFields = [];
+  const proseFields = [];
+  try {
+    const data = JSON.parse(text.length > 8000 ? text.slice(0, 8000) : text);
+    if (typeof data === "object" && data !== null) {
+      for (const key of ["error_code", "error_msg", "request_id"]) {
+        const value = data[key];
+        if (typeof value !== "string" || value.length === 0) continue;
+        const field = `${key}=${value}`;
+        if (key === "error_msg") proseFields.push(field);
+        else diagnosticFields.push(field);
+      }
+    }
+  } catch {
+  }
+  const hasAny = proseFields.length > 0 || diagnosticFields.length > 0;
+  const prose = hasAny ? redactLongTokens(redactCredentialLike(proseFields.join(" "))) : "";
+  const diagnostic = diagnosticFields.map(field => redactCredentialLike(field)).join(" ");
+  // request_id / trace_id / x-request-id / request-id intentionally kept readable —
+  // they are the key fields for tracing upstream interception (e.g. 403 cause).
+  const nonJsonPrefix = (() => {
+    let raw = text.slice(0, 400).replace(/[\uD800-\uDBFF]$/, '');
+    const placeholders = [];
+    raw = raw.replace(/((?:request_id|x-request-id|request-id|trace_id)\s*[=:]\s*)([^\s&"',;}\]]+)/gi, (m, prefix, val) => {
+      placeholders.push(val);
+      return prefix + '\u0000RID' + (placeholders.length - 1) + '\u0000';
+    });
+    let redacted = redactLongTokens(redactCredentialLike(raw));
+    redacted = redacted.replace(/\bCookie\s*:\s*[^\s]+/gi, '<redacted-cookie>');
+    redacted = redacted.replace(/\bx-auth-token\s*:\s*[^\s]+/gi, '<redacted-authtoken>');
+    redacted = redacted.replace(/\b(?:denied|error|sig)\s+([0-9a-fA-F]{32,})\b/g, (m, hex) => m.replace(hex, '<redacted-hex>'));
+    redacted = redacted.replace(/\btoken\s+blob\s+([A-Za-z0-9+/=]{16,})/gi, (m, b64) => m.replace(b64, '<redacted-b64>'));
+    for (let i = placeholders.length - 1; i >= 0; i--) redacted = redacted.replace('\u0000RID' + i + '\u0000', placeholders[i]);
+    const cleaned = redacted.replace(/[\x00-\x1f\x7f]/g, '').replace(/\s+/g, ' ').trim();
+    return cleaned.slice(0, 400);
+  })();
+  const joined = hasAny ? [prose, diagnostic].filter(part => part.length > 0).join(" ") : nonJsonPrefix ? `(non-json error body, ${text.length} bytes) ${nonJsonPrefix}` : `(non-json error body, ${text.length} bytes)`;
+  return joined.length > 500 ? `${joined.slice(0, 500)}\u2026` : joined;
+}
 function httpErrorCode(status, body) {
-  if (status === 401 || status === 403) return "AUTH";
+  if (status === 403) return "FORBIDDEN";
+  if (status === 401) return "AUTH";
   const detail = errorDetail(body);
   if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE;
   if (status === 429) return "RATE_LIMIT";
   if (status === 400) {
+    if (isApigAuthBody(body)) return "AUTH";
     if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE;
     return "INVALID_REQUEST";
   }
@@ -33043,6 +33149,9 @@ var CodeArtsAdapter = class extends LlmAdapter {
           const probe = await this.queryQueueStatus(credential, options.model, options.signal);
           if (probe === void 0 || probe.status === "working") {
             const code = httpErrorCode(response.status, errorText);
+            const failureLine = `[codearts] \u6a21\u578b\u8bf7\u6c42\u5931\u8d25\uff1aHTTP ${response.status} code=${code} detail=${safeUpstreamErrorDetail(errorText)}`;
+            console.warn(failureLine);
+            appendCodeartsFailureLog(failureLine);
             throw new LlmError2(`codearts: model request failed with HTTP ${response.status}`, code, { status: response.status });
           }
         }

@@ -344,7 +344,7 @@ window.__ModuleLoader__.load({
         'chan.login.expired': '等待超时，请重新发起登录。',
         'chan.login.done': '已接入：{login}',
         'chan.login.failed': '登录未完成：{reason}',
-        'chan.test.ok': '连接正常（{ms} ms）',
+        'chan.test.ok': '连接正常',
         'chan.test.failed': '测试失败：{reason}',
         'chan.claim.result': '已领取 {count} 个账号，共 {credit} 积分。',
         'chan.claim.none': '今天没有可领取的积分。',
@@ -355,6 +355,11 @@ window.__ModuleLoader__.load({
         'chan.model.on': '已开启',
         'chan.error': '操作失败：{reason}',
         'chan.confirm.delete': '移除账号 {name}？该账号的凭据会一并删除。',
+        'chan.confirm.delete.title': '确认移除账号',
+        'chan.confirm.delete.ok': '移除',
+        'chan.confirm.delete.cancel': '取消',
+        'chan.notice.removed': '已移除账号 {name}',
+        'chan.notice.cancelled': '已取消移除账号 {name}',
         'chan.rpc.unavailable': '宿主未提供 connection 服务，渠道操作暂不可用。',
         'nav.tab.ledger': '数据看板',
         'nav.tab.logs': '运行日志',
@@ -764,7 +769,7 @@ window.__ModuleLoader__.load({
         'chan.login.expired': 'Timed out — please start the sign-in again.',
         'chan.login.done': 'Connected: {login}',
         'chan.login.failed': 'Sign-in did not complete: {reason}',
-        'chan.test.ok': 'Connection healthy ({ms} ms)',
+        'chan.test.ok': 'Connection healthy',
         'chan.test.failed': 'Test failed: {reason}',
         'chan.claim.result': 'Claimed for {count} account(s), {credit} credits in total.',
         'chan.claim.none': 'Nothing to claim today.',
@@ -775,6 +780,11 @@ window.__ModuleLoader__.load({
         'chan.model.on': 'Shown',
         'chan.error': 'Action failed: {reason}',
         'chan.confirm.delete': 'Remove account {name}? Its credential is deleted with it.',
+        'chan.confirm.delete.title': 'Remove this account?',
+        'chan.confirm.delete.ok': 'Remove',
+        'chan.confirm.delete.cancel': 'Cancel',
+        'chan.notice.removed': 'Removed account {name}',
+        'chan.notice.cancelled': 'Removal cancelled for {name}',
         'chan.rpc.unavailable': 'This host exposes no connection service, so channel actions are unavailable.',
         'nav.tab.ledger': 'Dashboard',
         'nav.tab.logs': 'Request log',
@@ -2813,13 +2823,48 @@ window.__ModuleLoader__.load({
         try { await fn() } catch (error) { onError(channel, error) } finally { setBusy('') }
       }
 
+      /**
+       * Remove an account, confirming on the plugin's own self-drawn surface.
+       *
+       * Why not `window.confirm`: a native dialog is the one confirmation this
+       * UI ever used, and it is invisible in exactly the hosts that break. The
+       * browser suppresses it ("prevent this page from creating additional
+       * dialogs"), ESC or Cancel makes it return `false`, and an embedded
+       * WebView without dialog support returns `false` too. Every one of those
+       * produced `false`, and the old code `return`ed on it with no RPC, no
+       * toast, no notice and no log — which the user reads verbatim as "I
+       * clicked Remove and nothing happened". The native dialog is therefore
+       * gone, not merely guarded.
+       *
+       * `showToast` is the confirm surface: it is already how this plugin
+       * confirms an in-app upgrade (`reload.refresh` runs from its actions),
+       * it renders on every page because its host is `document.body`, and it
+       * cannot be suppressed by a dialog-blocking host. Two actions keep both
+       * directions visible — Remove commits, Cancel dismisses — and the button
+       * itself already reported the click by raising the busy state.
+       */
       const removeAccount = async accountId => {
         const entry = (accounts ?? []).find(row => row.id === accountId)
-        if (typeof window !== 'undefined' && typeof window.confirm === 'function'
-          && !window.confirm(t('chan.confirm.delete').replace('{name}', entry?.nickname ?? accountId))) return
-        await accountAction('del:' + accountId, accountId, async () => {
+        const name = entry?.nickname ?? accountId
+        const commit = () => accountAction('del:' + accountId, accountId, async () => {
+          // A `channel-pack/not-found` rejection carries the server's message, so
+          // onError reports "Account <id> not found" rather than a bare failure —
+          // the difference between "stale list, refresh and retry" and a mystery.
           await rpc('account.delete', { accountId })
           onChanged(); await loadAccounts()
+          setNotice(t('chan.notice.removed').replace('{name}', name))
+        })
+        showToast({
+          title: t('chan.confirm.delete.title'),
+          body: t('chan.confirm.delete').replace('{name}', name),
+          holdMs: 20000,
+          actions: [
+            { label: t('chan.confirm.delete.ok'), onClick: () => { void commit() } },
+            {
+              label: t('chan.confirm.delete.cancel'),
+              onClick: () => { showToast({ title: t('chan.notice.cancelled').replace('{name}', name), holdMs: 4000 }) },
+            },
+          ],
         })
       }
 
@@ -2904,10 +2949,17 @@ window.__ModuleLoader__.load({
                     h('button', {
                       type: 'button', className: 'ofm_minibtn', disabled: busy !== '' || !rpc,
                       onClick: () => accountAction('test:' + row.id, row.id, async () => {
-                        const value = await rpc('account.test', { accountId: row.id }, 90_000)
+                        // 150s：必须**明显大于**探针的 120s 硬上限（PROBE_TIMEOUT_MS），
+                        // 否则前端先 abort，服务端那条有价值的 message（排队超时等）就被
+                        // 掐掉，只剩一句「操作失败：AbortError」。
+                        const value = await rpc('account.test', { accountId: row.id }, 150_000)
+                        // 失败原因读 `message`：服务端 RpcTestAccountResponse 的字段名就是
+                        // `message`（仍受限：… / 无法确认：… / 排队超时…）。旧代码读 `error`
+                        // 恒为 undefined，故失败时永远只显示「测试失败：」。
+                        // `error` 仅作旧版 pack 的兼容兜底。
                         setNotice(value?.ok === false
-                          ? t('chan.test.failed').replace('{reason}', value?.error ?? '')
-                          : t('chan.test.ok').replace('{ms}', String(value?.ms ?? value?.latencyMs ?? '—')))
+                          ? t('chan.test.failed').replace('{reason}', value?.message ?? value?.error ?? '')
+                          : t('chan.test.ok'))
                       }),
                     }, t('chan.act.test')),
                     h('button', {

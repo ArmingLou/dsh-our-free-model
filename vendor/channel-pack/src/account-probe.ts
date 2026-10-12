@@ -162,6 +162,17 @@ export interface ProbeDeps {
   probe?: (entry: ProviderAccountEntry, modelId: string) => Promise<ProbeModelResult>
   /** 单次探测超时；默认 {@link PROBE_TIMEOUT_MS}。 */
   timeoutMs?: number
+  /**
+   * 诊断用的告警回调；默认无输出。
+   *
+   * 本模块刻意不依赖 Cordis 上下文（便于单测），所以它拿不到 `ctx.logger`。
+   * 但「测试」失败此前**一条日志都不落**（只 return），用户报障时服务端毫无线索。
+   * 由调用方（`channel-pack-rpc.ts`）把 `ctx.logger.warn` 绑进来即可，不必为此
+   * 改动任何既有签名。
+   *
+   * ⚠️ 只允许传 accountId / modelId / 上游错误文案，**禁止**传凭据（AK/SK/token）。
+   */
+  warn?: (message: string) => void
 }
 
 /**
@@ -369,6 +380,22 @@ async function probeWithAdapter(
     return { modelId, ok: true }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    // [patch-codearts-probe-queue-timeout] **先判我们自己的硬上限**：CodeArts 适配器在
+    // 排队时会以 10s 间隔重试最长 30 分钟（QUEUE_MAX_ATTEMPTS），而本探测只给
+    // timeoutMs。此时 signal.aborted 为真，但拿到的并不是上游的结论 —— 是我们自己
+    // 把请求掐了。若照原样拼进 `无法确认：…`，用户看到的是内部实现细节
+    // （"request aborted while waiting in queue"），既像 bug 又不可操作。
+    // 改成「排队超时，请稍后重试」这种能指导下一步的文案。
+    if (signal.aborted) {
+      const seconds = Math.round(timeoutMs / 1000)
+      return {
+        modelId,
+        ok: false,
+        message: /queue/i.test(message)
+          ? `排队超时：等待 ${seconds} 秒仍未获得可用并发，请稍后重试`
+          : `无法确认：探测超过 ${seconds} 秒未返回（${message}）`,
+      }
+    }
     if (isRateLimitFailure(error)) {
       // [patch-codearts-probe-ratelimit] 上游的重置时刻是**滚动**的：每次撞限流都会
       // 把它往后推。这里必须把它解析出来一并回传，否则调用方只能保留存储里的旧值，
@@ -530,7 +557,14 @@ export async function testAccount(
   } catch (error) {
     // 探测函数本身抛错（凭据解析异常等）：如实回报，不冒泡成 handler-failed。
     const reason = error instanceof Error ? error.message : String(error)
+    deps.warn?.(`[channel-pack] account.test 探测抛错：accountId=${accountId} modelId=${modelId} error=${reason}`)
     return { accountId, modelId, ok: false, message: `无法确认：${reason}` }
+  }
+
+  if (!outcome.ok) {
+    // 失败原因此前完全不落盘：用户报「测试失败」时，服务端没有任何可查的记录。
+    // 只记 id / 模型 / 上游文案 —— 绝不记凭据（AK/SK/token）。
+    deps.warn?.(`[channel-pack] account.test 失败：accountId=${accountId} modelId=${modelId} message=${outcome.message ?? ''}`)
   }
 
   return {

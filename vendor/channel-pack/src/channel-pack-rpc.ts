@@ -1955,7 +1955,19 @@ function registerChannelPackEndpoints(
 
       case 'account.delete': {
         const req = payload as RpcDeleteAccountRequest
-        await pool.removeAccount(req.accountId)
+        // 池里没有这个 id 时**回可读错误**而不是 `{ ok: true }`：前端的账号列表
+        // 可能已经过期（另一进程删过、或内存缓存与磁盘不一致），此时静默成功
+        // 会让用户刷新后发现「那一行还在」，也就是「移除无效」，且服务端无迹可寻。
+        // 错误码沿用本文件的规范信封，前端 unwrap 后由 onError 弹出 message。
+        if (!await pool.removeAccount(req.accountId)) {
+          return {
+            ok: false,
+            error: {
+              code: 'channel-pack/not-found',
+              message: `Account ${req.accountId} not found`,
+            },
+          }
+        }
         return { ok: true, value: undefined }
       }
 
@@ -2504,7 +2516,11 @@ function registerChannelPackEndpoints(
           }
         }
 
-        const value: RpcTestAccountResponse = await testAccount(pool, accountId, modelId)
+        const value: RpcTestAccountResponse = await testAccount(pool, accountId, modelId, {
+          // 探测模块本身不依赖 Cordis（便于单测），故拿不到 logger；在这里绑进去，
+          // 让「测试失败」第一次在服务端留痕。ctx 无 logger 时静默跳过。
+          warn: (message) => ctx.logger?.warn?.(message),
+        })
         return { ok: true, value }
       }
 

@@ -702,19 +702,43 @@ export class AccountPool {
     await this.writeAccounts(next)
   }
 
-  /** 删除账号（同时清理凭据） */
-  async removeAccount(id: string): Promise<void> {
+  /**
+   * 删除账号（同时清理凭据）。
+   *
+   * @returns `true` 表示确实删掉了一条，`false` 表示池里没有这个 id。
+   *
+   * ## 为什么要回报「是否真的删掉了」
+   *
+   * 旧实现对不存在的 id **静默 return**，而 RPC 层照旧回 `{ ok: true }`：
+   * 前端于是刷新列表、发现那一行还在，于是「移除按钮点了没反应」——
+   * 服务端日志里连一条记录都没有，这个故障无法被观测。
+   * `updateAccount` 对同一个错误一向抛 `Account ${id} not found`，
+   * 删除路径的沉默只是遗漏，不是设计。返回布尔量（而不是抛错）是
+   * **向后兼容**的选择：登录失败后的自动清理等 17 处调用点都是
+   * `void pool.removeAccount(id).catch(() => {})`，它们要的是「尽力清掉占位条目」，
+   * 一个不存在的 id 属于成功。调用方若需要区分，读返回值即可。
+   */
+  async removeAccount(id: string): Promise<boolean> {
     const entry = this.readAccounts().find(a => a.id === id)
-    if (!entry) return
+    if (!entry) return false
     try {
       await this.ctx.credentials.unset(credentialRef(entry.credentialRef))
-    } catch { /* 凭据可能已被删除 */ }
+    } catch (error) {
+      // 凭据可能已被删除，那确实无害。但**不能完全沉默**：unset 失败而
+      // state.json 随后丢失时，channel-pack-store 的 `bootstrapFromCredentialRefs`
+      // 会照着仍然存在的 ref 把这个账号**重建出来** —— 表现为「删了又回来」。
+      // 只记 id 与凭据名，绝不记值（凭据里是 token）。
+      this.ctx.logger?.warn?.(
+        `[channel-pack] 移除账号 ${id} 时清理凭据 ${entry.credentialRef} 失败，该账号可能在凭据回填后复活: ${String(error)}`,
+      )
+    }
     // ⚠ **必须重新读一次**（真实缺陷，审查发现）：`credentials.unset` 会挂起若干
     // 微任务/IO，期间并发的 `addAccount` 已经把新条目写进 `this.cache` 与磁盘。
     // 若此时拿 `await` **之前**的快照做 filter 再整体写回，那个新账号会被静默丢失
     // —— 而 `account.create`（登录成功即 addAccount）与 `account.delete` 天然可并发。
     // 重新读之后到 `writeAccounts` 之间没有 `await`，因而这一段是原子的。
     await this.writeAccounts(this.readAccounts().filter(a => a.id !== id))
+    return true
   }
 
   /**

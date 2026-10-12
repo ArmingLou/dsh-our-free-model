@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+import { chmodSync, closeSync, constants as fsConstants, lstatSync, openSync, writeSync } from 'node:fs'
 import {
   attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError,
   isQuotaExceededError, LlmAdapter, LlmError, QUOTA_EXCEEDED_CODE,
@@ -542,17 +543,327 @@ function errorDetail(body: string): string {
 }
 
 /**
+ * 华为 APIG 网关在**签名/令牌**类故障下回的错误体信号（无论状态码是 401 还是 403）。
+ *
+ * 实测（2026-10-10，本机真实凭据，故意篡改 token / AK / 置空 token 各一次）：
+ * **三种篡改全部返回 `401 + APIG.0301`**（`Incorrect IAM authentication
+ * information: Unauthorized`），网关**从不**用 403 表达鉴权失败 —— 故
+ * {@link httpErrorCode} 必须认这两个码，否则真正的鉴权失败会被归成别的码。
+ *
+ * 与 {@link isAuthError} 的判据保持同源，但**独立成函数**：那条判据还要额外
+ * 把 `401` / `403` **状态码本身**算作鉴权失败（用于刷新重试），而这里只判
+ * **错误体**，不改变刷新重试路径的任何行为。
+ */
+/** 403 诊断日志的固定落盘路径。 */
+const CODEARTS_FAILURE_LOG_PATH = '/tmp/codearts-403.log'
+
+/**
+ * 把一行失败诊断**安全**追加到 {@link CODEARTS_FAILURE_LOG_PATH}，全程静默失败。
+ *
+ * 全部调用都是**同步**的（`lstatSync` / `chmodSync` / `openSync` / `writeSync` /
+ * `closeSync`）：热路径不引入任何额外 `await` 或异步 I/O。整段包 try/catch，
+ * 取证是尽力而为，**绝不让写日志失败影响请求本身**。`node:fs` 非新依赖。
+ *
+ * ## ⚠️ 要保证的不变式：*要么以 0600 写入，要么不写*（CWE-732）
+ *
+ * `/tmp` 是 `drwxrwxrwt` 世界可写，诊断日志若以 0644 留存，等于把上游响应体暴露给
+ * 同机其他用户。`openSync(path, 'a', 0o600)` 的 mode **只对新建文件生效**，对既有
+ * 0644 文件无效 → 实测旧实现存在 `644 →(write 已落盘)→ 600` 的窗口，且内层
+ * `writeSync` 抛错时外层 catch 吞掉异常、`chmodSync` 整段被跳过，内容以 **0644 留存**。
+ * 故改为：
+ * 1. 文件不存在 → `openSync(path, 'wx', 0o600)` 独占创建，**天然 0600，无窗口**；
+ * 2. 已存在 → **先 `chmodSync(path, 0o600)` 再打开写入**，杜绝「写完才收紧」的窗口；
+ * 3. `writeSync` / `closeSync` 各自独立 try/catch，确保 fd 一定被 close（不泄漏）。
+ *
+ * ## ⚠️ symlink 防护（CWE-59）
+ *
+ * 路径硬编码在 `/tmp`（世界可写），任何本地用户都能预置同名 symlink 把写入重定向到
+ * 受害文件（实测旧实现的 `write` 与 `chmod` **都会跟随链接**）。两道防护：
+ * 打开时带 `fsConstants.O_NOFOLLOW`（POSIX 保证不跟随路径最后一段的 symlink），
+ * 并在写前用 `lstatSync().isSymbolicLink()` 独立判定一次 —— `O_NOFOLLOW` 不可用或
+ * 未被内核支持时（如 Windows）仍能拦住。**检测到 symlink 就不写。**
+ */
+function appendCodeartsFailureLog(line: string): void {
+  const payload = `${line}\n`
+  let fd: number | null = null
+  try {
+    let existing: ReturnType<typeof lstatSync> | undefined
+    try {
+      existing = lstatSync(CODEARTS_FAILURE_LOG_PATH)
+    } catch {
+      existing = undefined
+    }
+    // 路径是 symlink（或任一 lstat 异常）→ 直接放弃落盘，静默。
+    if (existing?.isSymbolicLink()) return
+    // O_NOFOLLOW：即使 lstat 与 open 之间被换成 symlink，内核也不会跟随。
+    // ⚠️ `openSync` 的 flags 传**数字**才会被原样交给 open(2)（传字符串走的是
+    // stringToFlags 白名单拼装，加不进 O_NOFOLLOW）。Windows 无此标志 → 取 0，
+    // 由下面的 lstat 判定兜底。
+    const noFollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0
+    if (existing === undefined) {
+      try {
+        // 独占创建：不存在时按 0600 建，天然满足不变式；已被并发抢先创建则 EEXIST。
+        fd = openSync(CODEARTS_FAILURE_LOG_PATH, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow, 0o600)
+      } catch {
+        // EEXIST / 权限不足 / 平台不支持 O_EXCL → 退到「收紧权限后再追加」分支。
+        fd = null
+      }
+    }
+    if (fd === null) {
+      // 先收紧权限**再**写：任何时刻都不存在「0644 且已写入新内容」的中间态。
+      chmodSync(CODEARTS_FAILURE_LOG_PATH, 0o600)
+      fd = openSync(CODEARTS_FAILURE_LOG_PATH, fsConstants.O_WRONLY | fsConstants.O_APPEND | noFollow)
+    }
+  } catch {
+    return
+  }
+  if (fd === null) return
+  try {
+    writeSync(fd, payload)
+  } catch {
+    // 写入失败：文件权限此时已是 0600（wx 新建或 chmod 先行），不留 0644 新内容。
+  }
+  try {
+    closeSync(fd)
+  } catch {
+    // 关闭失败不影响已写入的取证内容。
+  }
+}
+
+function isApigAuthBody(body: string): boolean {
+  // ⚠️ string 守卫：`httpErrorCode` 入参声明是 string，但它是纯函数、会被单测直接
+  // 调用；缺守卫会让 `httpErrorCode(400, null)` 抛 TypeError（补丁前返回
+  // INVALID_REQUEST），构成不必要的 API 形状变化。
+  if (typeof body !== 'string') return false
+  return body.includes('APIG.0301') || body.includes('APIG.0602')
+    || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body)
+}
+
+/**
+ * 判定一段候选串是否属于**上游诊断信息**（必须原样保留）。
+ *
+ * ⚠️ 取证优先原则（第二轮终审 Major 2 的直接教训）：本次改动的**唯一目的**就是
+ * 留存 403 的上游响应体，而 `request_id` / `InferHub.ModelArts.81111.429` /
+ * `modelarts.cn-north-4.myhuaweicloud.com` 这类串**就是**要取的东西。兜底擦除一旦
+ * 命中它们，取证价值直接归零。⇒ 宁可让规则 6 保守（少擦一点），也不要擦掉诊断信息。
+ *
+ * 三类豁免：
+ * 1. URL / 纯域名（含协议、IPv4，或 TLD 为纯字母 2..24 段）→ 端点信息；
+ * 2. 点分诊断码：`^[A-Za-z][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+){2,}$`
+ *    → `InferHub.ModelArts.81111.429` / `TM.00001041` / `APIG.0301`。
+ *    追加约束「每个点分段 ≤ 20 字符」：这样 base64 _blob.xxxx.yyyy 这类分段很长的
+ *    伪「点分码」仍会被擦，只有像错误码那样的短分段才豁免；
+ * 3. 点分段全部为纯字母数字（无 `-`/`_`/`/`）时不适用第 2 条的驼峰例外 —— 已在
+ *    {@link shouldRedactLongToken} 侧处理（见「内部驼峰」判据）。
+ */
+function isDiagnosticToken(token: string): boolean {
+  // (1) 带协议的 URL。
+  if (/[a-z][a-z0-9+.-]*:\/\//i.test(token)) return true
+  // (2) 纯域名：≥2 段、每段是合法 DNS label、首段字母开头、TLD 为 2..24 位纯字母。
+  //     ⚠️ 先剥掉前导 `/`：`https://host/x` 被候选字符类切开后，形如
+  //     `//host/path`，不剥会让第一段为空而误判成非域名。
+  //     注意 TLD 必须是纯字母 —— `InferHub.ModelArts.81111.429` 末段 `429` 是数字，
+  //     故它不会被这条误当作域名（由第 3 条按「诊断码」豁免）。
+  const host = token.replace(/^\/+/, '').split(/[/?#]/)[0]?.split(':')[0] ?? ''
+  const labels = host.split('.')
+  if (labels.length >= 2
+    && /^[A-Za-z]/.test(labels[0] ?? '')
+    && labels.every(label => /^[A-Za-z0-9-]{1,63}$/.test(label))
+    && /^[A-Za-z]{2,24}$/.test(labels[labels.length - 1] ?? '')) return true
+  // (3) 点分诊断码：≥3 段且每段都短（≤20）。base64 伪码分段很长，仍走擦除。
+  if (/^[A-Za-z][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+){2,}$/.test(token)
+    && token.split('.').every(segment => segment.length <= 20)) return true
+  return false
+}
+
+/**
+ * 兜底长串是否要擦除。调用方已保证候选串 ≥ 20 字符。
+ *
+ * - 诊断形态（域名 / 点分错误码 / URL）→ **不擦**（{@link isDiagnosticToken}）；
+ * - `request_id` 的 hex 值 → **不擦**（调用方按字段豁免，见 {@link safeUpstreamErrorDetail}）；
+ * - 长度 ≥ 32 的连续 `[A-Za-z0-9+/=_-]` → **擦**。这一条是为了补上旧实现「必须同时含
+ *   字母与数字」漏掉的形态：①纯字母长串 ②纯数字长串。长度 32 是安全线 —— 常见英文
+ *   单词最长也就 20 余字符（`authentication`(14) / `Unauthorized`(12) / `Insufficient`(11)），
+ *   故 32 以上的纯字母串不可能是自然语言，不会误伤文案；
+ * - 20..31 字符：擦「同时含字母与数字」的（保留旧行为），外加**含内部驼峰**的纯字母
+ *   标识符（`AllLettersOnlyTokenValueAbcdef` 这类无空格长标识符。自然语言的单词是
+ *   单首字母大写，不含内部大写）。
+ */
+function shouldRedactLongToken(token: string): boolean {
+  if (isDiagnosticToken(token)) return false
+  if (token.length >= 32) return true
+  if (/[A-Za-z]/.test(token) && /[0-9]/.test(token)) return true
+  return /^[A-Za-z0-9+/=_-]+$/.test(token) && /[a-z][A-Z]/.test(token)
+}
+
+/**
+ * **值级**凭据形态擦除（与字段白名单互补的第二道防线）。
+ *
+ * ⚠️ 为什么光有字段白名单不够：白名单只约束**字段名**，而 `error_msg` 的**值**
+ * 是上游自由文本，网关完全可能把回显的签名/令牌写进去。实测泄漏形态：
+ * `{"error_msg":"... AK=AKIAIOSFODNN7EXAMPLE signature=deadbeefcafe"}`、
+ * `{"error_msg":"Authorization: Bearer eyJ…"}`、`{"error_msg":"security_token=…"}`
+ * 都会把凭据明文带进日志 —— 目标：**明显凭据形态宁可多擦一点，也不能漏**。
+ *
+ * ⚠️ 同时**不能**误伤正常人类可读的原因（那是最有价值的证据）：
+ * `Incorrect IAM authentication information: Unauthorized` 必须原样保留。故：
+ * - 本函数只处理**明显凭据形态**（下 1)~5)），它们已实测不误伤诊断串；
+ * - 兜底长串擦除拆到 {@link redactLongTokens}，并由调用方按字段决定是否启用
+ *   （`request_id` 的值只过本函数，保留可读的 hex 值）；
+ * - key=value 只认**凭据类**键名，`error_code` / `error_msg` / `request_id`
+ *   这类诊断字段不在其中，不会被自己的键名误伤；
+ * - `token expired: X` 只擦冒号后的值，保留 `token expired` 这个关键线索。
+ */
+function redactCredentialLike(line: string): string {
+  return line
+    // 1) `Bearer <token>`（含 `Authorization: Bearer …`）：只擦令牌，保留 `Bearer` 字样。
+    .replace(/\b(bearer)\s+[\w\-._~+/=]+/gi, '$1 <redacted>')
+    // 2) JWT：三段 base64url（形如 eyJ….….…）。
+    .replace(/\beyJ[\w-]{4,}\.[\w-]+(?:\.[\w-]*)?/g, '<redacted-jwt>')
+    // 3) AWS 风格 access key id（AKIA/ASIA/AGPA/AIDA + 长串大写字母数字）。
+    .replace(/\b(?:AKIA|ASIA|AGPA|AIDA)[0-9A-Z]{8,}\b/g, '<redacted-ak>')
+    // 4) 凭据类 key=value / key:value（大小写不敏感，值到空白/引号/逗号/分号为止）。
+    .replace(
+      /\b((?:x-)?(?:security[_-]?token|access[_-]?key[_-]?id|secret[_-]?access[_-]?key|secret[_-]?key|api[_-]?key|apikey|signature|authorization|credential|password|passwd)\s*[=:]\s*)["']?[^\s"',;}\]]+["']?/gi,
+      '$1<redacted>',
+    )
+    // 5) 「token/secret/… expired|invalid: 值」：只擦冒号后的值，保留前半句线索。
+    .replace(
+      /\b(token|secret|signature|credential|password)\b(\s+(?:is\s+)?(?:expired|invalid|revoked)\s*[::]\s*)["']?[^\s"',;}\]]+["']?/gi,
+      '$1$2<redacted>',
+    )
+}
+
+/**
+ * 兜底长串擦除（规则 6）。只在这里做「非诊断串才算凭据」的判断，
+ * 逐串回调用 {@link shouldRedactLongToken}，避免一条正则把所有点分串一刀切。
+ *
+ * ⚠️ 字符类**刻意不含 `=`**：候选串在 `key=` 的 `=` 处断开，这样
+ * `foo=<32 位以上纯字母>` 的**键名**不会被整条擦掉（诊断字段名要保留），
+ * 只有值部分参与判断；base64 尾部 `=` 填充同理落在候选外。
+ */
+function redactLongTokens(line: string): string {
+  return line.replace(/[A-Za-z0-9+/._-]{20,}/g, token => (shouldRedactLongToken(token) ? '<redacted-longtoken>' : token))
+}
+
+
+
+/**
+ * 把上游错误体压成一行**可安全落日志**的摘要（截断 500 字）。
+ *
+ * 两道防线，缺一不可：
+ * 1. **字段级**：只保留 `error_code` / `error_msg` / `request_id` 三个诊断字段；
+ * 2. **值级**：拼接结果再过 {@link redactCredentialLike} —— 上游可能把凭据回显在
+ *    `error_msg` 的**值**里，光有字段白名单会漏（见该函数注释的实测泄漏形态）。
+ *
+ * 非 JSON 错误体走内联可读前缀：给出**擦除后**的可读前缀
+ * （第四轮：只报字节数等于零取证价值，而 403 的真实原因就在这几百字节里）。
+ */
+function safeUpstreamErrorDetail(body: string): string {
+  if (typeof body !== 'string') return ''
+  const text = body.trim()
+  if (text.length === 0) return ''
+  // `diagnosticFields` 的值只过凭证形态擦除、不过兜底长串擦除：
+  // `request_id` / `error_code` 是追查故障的关键字段（华为云 request_id 形如 `6c1a…`，
+  // 正是这次 403 取证要引用的东西），不是凭据，必须可读、可 grep。
+  const diagnosticFields: string[] = []
+  // `proseFields` 的值两者都过（`error_msg` 是自由文本，最可能回显凭据）。
+  const proseFields: string[] = []
+  try {
+    // 只在 8 KB 窗口内尝试解析：避免对超大错误体做无谓的 JSON.parse。
+    const data = JSON.parse(text.length > 8000 ? text.slice(0, 8000) : text) as unknown
+    if (typeof data === 'object' && data !== null) {
+      const record = data as Record<string, unknown>
+      for (const key of ['error_code', 'error_msg', 'request_id'] as const) {
+        const value = record[key]
+        if (typeof value !== 'string' || value.length === 0) continue
+        const field = `${key}=${value}`
+        if (key === 'error_msg') proseFields.push(field)
+        else diagnosticFields.push(field)
+      }
+    }
+  } catch {
+    // 非 JSON 错误体：网关/WAF 的 HTML 拦截页走下面的可读前缀。
+  }
+  const hasAny = proseFields.length > 0 || diagnosticFields.length > 0
+  const prose = hasAny ? redactLongTokens(redactCredentialLike(proseFields.join(' '))) : ''
+  const diagnostic = diagnosticFields.map(field => redactCredentialLike(field)).join(' ')
+  // request_id / trace_id / x-request-id / request-id intentionally kept readable —
+  // they are the key fields for tracing upstream interception (e.g. 403 cause).
+  const nonJsonPrefix = (() => {
+    let raw = text.slice(0, 400).replace(/[\uD800-\uDBFF]$/, '')
+    const placeholders: string[] = []
+    raw = raw.replace(/((?:request_id|x-request-id|request-id|trace_id)\s*[=:]\s*)([^\s&"',;}\]]+)/gi, (_m, prefix: string, val: string) => {
+      placeholders.push(val)
+      return prefix + '\u0000RID' + (placeholders.length - 1) + '\u0000'
+    })
+    let redacted = redactLongTokens(redactCredentialLike(raw))
+    redacted = redacted.replace(/\bCookie\s*:\s*[^\s]+/gi, '<redacted-cookie>')
+    redacted = redacted.replace(/\bx-auth-token\s*:\s*[^\s]+/gi, '<redacted-authtoken>')
+    redacted = redacted.replace(/\b(?:denied|error|sig)\s+([0-9a-fA-F]{32,})\b/g, (m, hex: string) => m.replace(hex, '<redacted-hex>'))
+    redacted = redacted.replace(/\btoken\s+blob\s+([A-Za-z0-9+/=]{16,})/gi, (m, b64: string) => m.replace(b64, '<redacted-b64>'))
+    for (let i = placeholders.length - 1; i >= 0; i--) redacted = redacted.replace('\u0000RID' + i + '\u0000', placeholders[i])
+    const cleaned = redacted.replace(/[\x00-\x1f\x7f]/g, '').replace(/\s+/g, ' ').trim()
+    return cleaned.slice(0, 400)
+  })()
+  const joined = hasAny
+    ? [prose, diagnostic].filter(part => part.length > 0).join(' ')
+    : nonJsonPrefix ? `(non-json error body, ${text.length} bytes) ${nonJsonPrefix}` : `(non-json error body, ${text.length} bytes)`
+  // ⚠️ 顺序：**先擦后截**。反过来（先截 500 再擦）可能只截到凭据前半截而漏擦。
+  return joined.length > 500 ? `${joined.slice(0, 500)}…` : joined
+}
+
+/**
  * 将 CodeArts 错误响应归一化为 harness 错误码，与 deepseek 适配器的
  * httpErrorCode 词汇一致：400 且命中上下文超限措辞时归为
  * CONTEXT_WINDOW_EXCEEDED（触发 dsh compaction 自动压缩上下文），
  * 而不是不可重试的 HTTP_400，避免长会话在接近窗口上限时直接中断。
+ *
+ * ## ⚠️ 403 **绝不**取 `AUTH`（方向性误报，已确证）
+ *
+ * 原实现写 `if (status === 401 || status === 403) return 'AUTH'`。但华为 APIG
+ * 网关对签名/令牌类故障一律回 **401 + APIG.0301**，**从不**回 403；于是 403
+ * 实际承载的是「权限/策略/地域/模型授权」这类原因，把它标成 `AUTH` 会让 DSH UI
+ * 把整条真实原因替换成固定文案「API 密钥无效」（`dsh-client-ui-chat/lib/client.js:1223`
+ * `failureMessage()`，并在 `:7392 displayFailure()` 对 AUTH 强制 `message: ""`）——
+ * 用户被引向完全错误的方向，且真实原因一个字都到不了眼前。
+ *
+ * ⇒ 401 仍是 `AUTH`（那是真的鉴权失败，UI 提示重新登录正确）；403 改归
+ * `FORBIDDEN`，让 message 原样透出。该码**不在** harness 的
+ * `DEFAULT_RETRYABLE_CODES`（`EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` /
+ * `TIMEOUT` / `TRANSPORT`）里 —— 「这个请求不被允许」是确定性结论。
+ *
+ * ⚠️ **APIG 码升级只允许发生在 `400` 分支内**（终审实测回归后收窄，原为全状态码）
+ *
+ * 之前写成 `if (status === 401 || isApigAuthBody(body)) return 'AUTH'`，把 body 判据
+ * 提到了所有状态码之前，终审用「status 100..599 × 4 种 body」的差分探针实测到回归：
+ * `httpErrorCode(500, 'token expired')` 从 `SERVER` 变成 `AUTH`（502/503 同理），
+ * `httpErrorCode(429, 'token expired')` 从 `RATE_LIMIT` 变成 `AUTH`。双重危害：
+ * 1. **丢失可重试性** —— `dsh-llm-retry/lib/index.js:160` 只在
+ *    `policy.retryableCodes.includes(code)` 时重试，而 `DEFAULT_RETRYABLE_CODES`
+ *    = `EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`
+ *    （`dsh-llm/lib/types/retry-policy.js:16-22`）**不含 `AUTH`** ⇒ 瞬时 5xx /
+ *    限流不再重试，直接失败。
+ * 2. **重新引入本补丁要消灭的误诊** —— `AUTH` 会让 UI 把真实原因替换成
+ *    「API 密钥无效」，于是 `500 + token expired` 时用户**又**看到那句错误提示。
+ *
+ * ⇒ 收窄为：**429 / 5xx / 其它状态码分支与补丁前逐字节一致**，body 升级只放在
+ * `400` 分支内（400 本来只返回 `INVALID_REQUEST`，升级为 `AUTH` 有实际意义：
+ * 实测 `APIG.0602` 正是出现在 400 上）。
+ *
+ * 判据与 {@link isAuthError} 对齐：认 `APIG.0301` / `APIG.0602`，所以网关把
+ * 鉴权失败放在 400 上时也能正确归为 `AUTH`（401 仍由状态码本身直接判定）。
  */
 function httpErrorCode(status: number, body: string): string {
-  if (status === 401 || status === 403) return 'AUTH'
+  if (status === 403) return 'FORBIDDEN'
+  if (status === 401) return 'AUTH'
   const detail = errorDetail(body)
   if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE
   if (status === 429) return 'RATE_LIMIT'
   if (status === 400) {
+    // ⚠️ body 升级只作用于 400（见上方注释）：这是网关把鉴权失败放在非 401
+    // 状态码上的唯一实测形态，且 400 的默认码（INVALID_REQUEST）本就不重试。
+    if (isApigAuthBody(body)) return 'AUTH'
     if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE
     return 'INVALID_REQUEST'
   }
@@ -1328,6 +1639,22 @@ export class CodeArtsAdapter extends LlmAdapter {
             // 与 deepseek 适配器的 httpErrorCode 词汇保持一致；
             // 400 + 上下文超限措辞归为 CONTEXT_WINDOW_EXCEEDED（触发 compaction）。
             const code = httpErrorCode(response.status, errorText)
+            // 让失败可诊断：`errorText`（上游错误体）此前在此被**彻底丢弃** ——
+            // 既不落日志也不进 error 对象，导致 403/500 的真实原因零样本，
+            // 只能看到一句 `model request failed with HTTP 403`。
+            // ⚠️ 必须过 `safeUpstreamErrorDetail`：它做**字段白名单 + 值级擦除**两道
+            // 过滤（只取 error_code / error_msg / request_id，且对拼出的字符串再过
+            // `redactCredentialLike` / `redactLongTokens`）——光有字段白名单不够，
+            // 上游会把凭据回显在 `error_msg` 的**值**里；而 request_id 这类诊断字段
+            // 的值又要保住可读性，故两者的擦除口径不同（见该函数注释）。
+            // 非 JSON 体（403 实测的 1166 字节 HTML 拦截页）额外给出**擦除后**的
+            // 可读前缀，否则「403 到底是谁挡的」永远没有样本。
+            const failureLine = `[codearts] 模型请求失败：HTTP ${response.status} code=${code} detail=${safeUpstreamErrorDetail(errorText)}`
+            console.warn(failureLine)
+            // ⚠️ `console.warn` 不一定有出口：DSH 宿主对插件 console/stderr **无任何
+            // 包装、重定向或落盘**（实测进程 fd2 连的是启动 `dsh web` 的终端 pty，
+            // 见 lsof），终端面板一关就彻底丢失，而这是 403 唯一取证口。
+            appendCodeartsFailureLog(failureLine)
             throw new LlmError(`codearts: model request failed with HTTP ${response.status}`, code, { status: response.status })
           }
           // probe.status 为 'waiting' 或 'queue_full' → 落入下方排队流程。
