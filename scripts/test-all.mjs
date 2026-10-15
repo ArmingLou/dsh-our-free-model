@@ -58,6 +58,8 @@ const suites = [
   ['effort', 'effort-test.mjs', []],
   ['projection', 'projection-test.mjs', []],
   ['fingerprint', 'fingerprint-test.mjs', []],
+  ['free-lane-wire', 'free-lane-wire-test.mjs', []],
+  ['freetier-gate', 'freetier-gate-test.mjs', []],
   ['sniff', 'sniff-test.mjs', []],
   ['truncation', 'truncation-test.mjs', []],
   ['recovery', 'recovery-test.mjs', []],
@@ -67,6 +69,7 @@ const suites = [
   ['tui', 'tui-test.mjs', []],
   ['catalog', 'catalog-test.mjs', mode === 'contributor' ? ['--contributor'] : []],
   ['vault', 'vault-test.mjs', []],
+  ['mint-eac-seal', 'mint-eac-seal-test.mjs', []],
   ['eac-auth', 'eac-auth-test.mjs', []],
   ['eac-login', 'eac-login-test.mjs', []],
   ['kilo', 'kilo-test.mjs', []],
@@ -77,6 +80,7 @@ const suites = [
   // module with its own offline suite; `aggregate-wiring` is the one that
   // proves the host actually reaches them.
   ['rtk', 'rtk-test.mjs', []],
+  ['rtk-shape', 'rtk-shape-test.mjs', []],
   ['local-optimize', 'local-optimize-test.mjs', []],
   ['registry', 'registry-test.mjs', []],
   ['route', 'route-test.mjs', []],
@@ -85,6 +89,7 @@ const suites = [
   ['anthropic', 'anthropic-test.mjs', []],
   ['aggregate', 'aggregate-test.mjs', []],
   ['aggregate-wiring', 'aggregate-wiring-test.mjs', []],
+  ['gateway-source', 'gateway-source-test.mjs', []],
 ].filter(([name]) => (mode === 'contributor' ? !['manifest', 'release'].includes(name)
   : mode === 'release' ? releaseSuites.has(name) : true)
   && (only === null || name.startsWith(only)))
