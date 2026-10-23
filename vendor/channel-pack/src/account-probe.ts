@@ -37,6 +37,7 @@ import { lobsteraiProductById } from './lobsterai-product.js'
 import { qoderProductById } from './qoder-product.js'
 import { clineProductById } from './cline-product.js'
 import { zcodeProductById } from './zcode-product.js'
+import { CodeArtsAdapter } from './llm-adapter.js'
 import { GeminiAdapter } from './gemini-adapter.js'
 import { GEMINI, GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
 import type { LobsteraiCredential } from './lobsterai.js'
@@ -46,6 +47,7 @@ import type { ZcodeCredential } from './zcode.js'
 import type { TraeCredential } from './trae.js'
 import type { GeminiCredential } from './gemini.js'
 import type {
+  CodeArtsCredential,
   ProbeAccountResult,
   ProbeModelResult,
   ProviderAccountEntry,
@@ -295,8 +297,12 @@ async function probeWithAdapter(
       project: GEMINI_DEFAULT_PROJECT,
       product: GEMINI,
     })
-  } else {
-    throw new Error(`Unsupported probe adapter: ${entry.provider}`)
+  } else if (entry.provider === 'codearts') {
+    adapter = new CodeArtsAdapter({
+      credentialRef: ref,
+      resolveCredential: async () => credential as CodeArtsCredential,
+      refresh: async () => {},
+    })
   }
 
   try {

@@ -27999,6 +27999,9 @@ var MemoryStore = class {
 };
 var REF_PREFIX_TO_PROVIDER = [
   ["LOBSTERAI", "lobsterai"],
+  // ⚠️ CodeArts（华为云）在 OFM 里被保留为第 11 个渠道，故必须回到本表：
+  // 漏加 = 该 provider 的账号在状态文档丢失后静默消失 + 所有携带该 provider 的 RPC 被判为「不支持此渠道」。
+  ["CODEARTS", "codearts"],
   ["QODER", "qoder"],
   ["QODERCN", "qodercn"],
   ["TRAE", "trae"],
@@ -55643,8 +55646,13 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
       project: GEMINI_DEFAULT_PROJECT,
       product: GEMINI
     });
-  } else {
-    throw new Error(`Unsupported probe adapter: ${entry.provider}`);
+  } else if (entry.provider === "codearts") {
+    adapter = new CodeArtsAdapter({
+      credentialRef: ref,
+      resolveCredential: async () => credential,
+      refresh: async () => {
+      }
+    });
   }
   try {
     for await (const _chunk of adapter.stream({
@@ -65347,7 +65355,7 @@ function apply(ctx, config = {}) {
     void geminiSigStore.flush().catch(() => {
     });
   });
-  registerChannelPackRpc(ctx, pool, codearts, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
+  registerChannelPackRpc(ctx, pool, service, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
     ...config
   });
   mountOpenAiGateway(ctx, pool);

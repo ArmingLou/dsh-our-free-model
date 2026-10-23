@@ -338,6 +338,9 @@ class MemoryStore implements ChannelPackStore {
  */
 const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['LOBSTERAI', 'lobsterai'],
+  // ⚠️ CodeArts（华为云）在 OFM 里被保留为第 11 个渠道，故必须回到本表：
+  // 漏加 = 该 provider 的账号在状态文档丢失后静默消失 + 所有携带该 provider 的 RPC 被判为「不支持此渠道」。
+  ['CODEARTS', 'codearts'],
   ['QODER', 'qoder'],
   ['QODERCN', 'qodercn'],
   ['TRAE', 'trae'],
