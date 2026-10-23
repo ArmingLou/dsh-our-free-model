@@ -3,35 +3,9 @@
  *
  * ## 为什么单独成模块
  *
- * `src/buddy-adapter.ts` 与 `src/lobsterai-adapter.ts` 各自内联了一套**完全同源**
- * 的逻辑（消息序列化约 200 行、SSE 消费约 230 行），差异只在 URL、请求头与
- * 少数厂商特有字段上。第三个 OpenAI 兼容 provider（qoder）若再复制一份，
- * 这三份实现会在后续修 bug 时逐渐分叉 —— 而它们处理的都是
- * **OpenAI 协议层的通用陷阱**（工具配对、null 字段、分片合并），与厂商无关。
- *
  * 因此本模块把这部分抽出来给 **qoder 适配器**使用。
  *
- * ⚠️ **既有适配器（buddy / lobsterai）刻意不改用它**：那两份实现已被大量
- * 单测与线上流量验证过，重构它们属于与本任务无关的高风险改动。若将来要
- * 统一，应作为独立任务并配以逐条对拍测试。
- *
  * ## 本模块承载的实测教训（逐条都有真实缺陷背景）
- *
- * - **`typeof x === 'string'` 而非 `!== undefined`**：真实 SSE 里一个模型要么走
- *   `content`、要么走 `reasoning_content`，**另一侧恒为 `null`**。只判 undefined
- *   会让 `.length` 在 null 上崩溃（表现为每轮对话第一帧就报
- *   `Cannot read properties of null`）。
- * - **思考字段有两个名字**：`reasoning_content`（Qoder / buddy）与
- *   `reasoning`（**Cline**，实测形如
- *   `{"delta":{"reasoning":"The","reasoning_details":[…]}}`）。只认前者会让
- *   Cline 的思考内容被静默丢弃（表现为「模型不思考」）。两者语义相同，
- *   由同一分支经 `??` 合并处理。
- * - **工具配对剔除**：孤儿 tool_call / tool_result 会让后端 400，且坏历史被每次
- *   请求原样重放 —— 会话彻底报废。发出前剔除可让会话自愈。
- * - **`function.name` 只允许非空覆盖**：后续分片带空串 `""` 会清空已解析出的
- *   工具名 → `unknown tool ""`。
- * - **残缺参数不补 `{}`**：那会伪造出合法外观，让 harness 报 schema 错误而非
- *   重试；正确做法是判 `max-tokens` 让 dsh 重试。
  */
 
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
@@ -67,7 +41,6 @@ export function contentToText(content: unknown): string {
     .join('')
 }
 
-/** 工具结果内嵌图片的载体文本（与 buddy / lobsterai 适配器同名同义）。 */
 export const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
 
 /**
@@ -201,6 +174,7 @@ export function serializeMessages(
         .map((block) => String(block.text))
         .join('')
       const text = contentToText(content)
+      if (text.trim().length === 0 && toolCalls.length === 0) continue
       // 挂起的工具结果图片必须在 assistant 之前发出，否则会漂到这条
       // assistant 之后，与产生它们的工具调用脱节。
       flushToolImages()
@@ -230,7 +204,7 @@ export function serializeMessages(
     if (parts !== undefined) {
       flushToolImages()
       wire.push({ role: 'user', content: parts })
-    } else if (text.length > 0 || toolResults.length === 0) {
+    } else if (text.trim().length > 0) {
       flushToolImages()
       wire.push({ role: 'user', content: text })
     }
@@ -386,6 +360,10 @@ export interface ConsumeOpenAiSseOptions {
    * ⚠️ 回调**抛错会被吞掉**：观测失败绝不能把一次正常推理打死。
    */
   onFrame?: (data: Record<string, unknown>) => void
+  /** 将 wire 侧规范化的工具名还原为调用方名称。 */
+  restoreToolName?: (name: string) => string
+  /** Provider-specific quota errors, including HTTP 200 error envelopes. */
+  isQuotaError?: (data: Record<string, unknown>) => boolean
 }
 
 /**
@@ -414,6 +392,7 @@ export async function* consumeOpenAiSse(
   config: ConsumeOpenAiSseOptions,
 ): AsyncIterable<StreamChunk> {
   const { label } = config
+  const restoreToolName = config.restoreToolName ?? ((name: string) => name)
   if (!response.body) throw new LlmError(`${label}: empty model response body`, 'EMPTY_RESPONSE')
 
   const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
@@ -428,11 +407,6 @@ export async function* consumeOpenAiSse(
    * **正文**死循环检测（**独立实例**，见 `createReasoningLoopDetector`）。
    *
    * ## 真实缺陷（用户报障，2026-09-25）
-   *
-   * 唯一活动 session（`lilishop-go` / `workbuddy/hy4-preview-f`）出现**正文**循环。
-   * 旧实现只在 reasoning 分支调 `observe`，正文分支从不调用 → 正文循环**完全
-   * 看不见**。用真实检测器回放该会话正文，三段全部命中（去重率 0.0412 /
-   * 0.0938 / 0.1745，阈值 < 0.35）—— **不是循环不够长，是通道没接**。
    *
    * ## ⚠️ 为什么必须与 `loopGuard` **分成两个实例**
    *
@@ -469,6 +443,7 @@ export async function* consumeOpenAiSse(
    * 就不发任何 chunk（与「空名字 tool_call」同型修法）。
    */
   const suppressor = createBlankReasoningSuppressor()
+  const proseSuppressor = createBlankReasoningSuppressor()
   const toolCalls = new Map<number, {
     index: number
     text: string
@@ -506,6 +481,7 @@ export async function* consumeOpenAiSse(
    * 非 SSE 响应时把它拼进错误消息，否则用户只能看到一个没有原因的失败。
    */
   let rawSnippet = ''
+  let rawJson = ''
 
   try {
     for (;;) {
@@ -526,6 +502,9 @@ export async function* consumeOpenAiSse(
       }
       if (result.done) break
       const decoded = decoder.decode(result.value, { stream: true })
+      if (!sawDataFrame && config.isQuotaError !== undefined && rawJson.length < 65_536) {
+        rawJson = (rawJson + decoded).slice(0, 65_536)
+      }
       if (rawSnippet.length < RAW_SNIPPET_LIMIT) {
         rawSnippet = (rawSnippet + decoded).slice(0, RAW_SNIPPET_LIMIT)
       }
@@ -577,13 +556,6 @@ export async function* consumeOpenAiSse(
               reasoning_content?: string | null
               /**
                * 思考增量的**另一种字段名**（Cline 用这个）。
-               *
-               * ⚠️ Cline 的实测 SSE 是
-               * `{"delta":{"reasoning":"The","reasoning_details":[…]}}`，
-               * **不是** `reasoning_content`（后者是 Qoder / buddy 的形态）。
-               * 只认 `reasoning_content` 会让 Cline 的思考内容被静默丢弃
-               * （表现为「模型不思考」，且 reasoning 档位看似无效）。
-               * 两者由下方同一分支处理（同一帧只会出现其中一个）。
                */
               reasoning?: string | null
               tool_calls?: Array<{
@@ -616,6 +588,9 @@ export async function* consumeOpenAiSse(
           } catch {
             // 观测是尽力而为，吞掉异常（见选项注释）。
           }
+        }
+        if (data.choices === undefined && config.isQuotaError?.(data)) {
+          throw new LlmError(`${label}: ${errorDetail(payload)}`, 'QUOTA_EXCEEDED')
         }
         if (data.error !== undefined) {
           throw new LlmError(`${label}: ${data.error.message ?? 'unknown error'}`, 'SERVER')
@@ -734,11 +709,12 @@ export async function* consumeOpenAiSse(
         // 一个模型要么走 content、要么走 reasoning_content，**另一侧恒为
         // `null`**。只判 undefined 会让 `.length` 在 null 上崩溃。
         const deltaContent = delta?.content
-        const textDelta = typeof deltaContent === 'string' && deltaContent.length > 0
+        const rawTextDelta = typeof deltaContent === 'string' && deltaContent.length > 0
           ? deltaContent
           : (!gotAnyContent && typeof choice?.message?.content === 'string' ? choice.message.content : undefined)
+        if (typeof deltaContent === 'string' && deltaContent.length > 0) gotAnyContent = true
+        const textDelta = rawTextDelta === undefined ? undefined : proseSuppressor.feed(rawTextDelta)
         if (textDelta !== undefined && textDelta.length > 0) {
-          if (typeof deltaContent === 'string' && deltaContent.length > 0) gotAnyContent = true
           let block = blocks.find(candidate => candidate.kind === 'text')
           if (block === undefined) {
             block = { index: nextIndex++, kind: 'text', text: '' }
@@ -778,7 +754,7 @@ export async function* consumeOpenAiSse(
         }
         // 同样必须用 `typeof === 'string'`：reasoning_content 也会显式返回 null。
         //
-        // ⚠️ **两个字段名都要认**：Qoder / buddy 用 `reasoning_content`，
+
         // **Cline 用 `reasoning`**（实测 SSE 形如
         // `{"delta":{"reasoning":"The","reasoning_details":[…]}}`）。
         // 只认前者会让 Cline 的思考内容被静默丢弃 —— 用户看到「模型不思考」，
@@ -845,7 +821,7 @@ export async function* consumeOpenAiSse(
           // （实测 seq=693：`{index:2, id:'call_25e9…', args:[""]}`）——
           // 于是 `BlockAssembler` 为它建了一个 partial，收尾时组装出
           // `{type:'tool-call', name:''}`。这条空名字块被 harness 执行成
-          // `unknown tool ""`、**持久化进会话**，之后切到 workbuddy 时被每次
+
           // 请求原样重放 → **HTTP 400 code 11133**，整条会话报废。
           //
           // 注意：**只跳过收尾的 `block-end` 是不够的** —— 上游
@@ -864,7 +840,7 @@ export async function* consumeOpenAiSse(
               type: 'tool-call-delta',
               index: block.index,
               id: ToolCallId(callId),
-              name: block.name!,
+              name: restoreToolName(block.name!),
               argumentsDelta: block.text,
             }
             continue
@@ -873,7 +849,7 @@ export async function* consumeOpenAiSse(
             type: 'tool-call-delta',
             index: block.index,
             id: ToolCallId(callId),
-            ...block.name !== undefined ? { name: block.name } : {},
+            ...block.name !== undefined ? { name: restoreToolName(block.name) } : {},
             argumentsDelta: fragment,
           }
         }
@@ -958,7 +934,7 @@ export async function* consumeOpenAiSse(
       block: {
         type: 'tool-call',
         id: ToolCallId(block.callId ?? ''),
-        name: block.name!,
+        name: restoreToolName(block.name!),
         // 仅把「无参数工具下发的空分片」补成 {}；**残缺参数保持原样**，
         // 由 max-tokens 判定触发重试 —— 把残缺 JSON 补成 {} 会伪造出
         // 合法外观，让 harness 报 missing required property 而非重试。
@@ -1028,10 +1004,12 @@ export async function* consumeOpenAiSse(
     // 标签后仅 13 字符）。此时**不发射空 text 块** —— 空块会污染会话，
     // 且 DSH 的 `EMPTY_RESPONSE` 契约禁止产出空内容块。
     // 但**思考段已归位**，故本响应仍有内容产出，不会被误判为零块。
-    if (cleanedText !== '') {
+    if (cleanedText.trim() !== '') {
       blockCount += 1
       emittedProse = cleanedText
       yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleanedText } }
+    } else {
+      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: '' } }
     }
   }
   const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
@@ -1077,6 +1055,12 @@ export async function* consumeOpenAiSse(
   // 而是「响应压根不是 SSE」（网关/错误页直接回了一段 JSON）。
   // 若与下面的截断判定混在一起，用户只会看到一个没有原因的失败。
   if (!sawDataFrame) {
+    let data: unknown
+    try { data = JSON.parse(rawJson) } catch {}
+    if (typeof data === 'object' && data !== null && !Array.isArray(data)
+      && config.isQuotaError?.(data as Record<string, unknown>)) {
+      throw new LlmError(`${label}: ${errorDetail(rawJson)}`, 'QUOTA_EXCEEDED')
+    }
     const snippet = rawSnippet.trim()
     if (snippet.length > 0) {
       throw new LlmError(

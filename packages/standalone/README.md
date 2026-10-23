@@ -1,7 +1,7 @@
 # Our Free Model 独立本地服务
 
 这是独立产品的源码入口，不需要 DSH、Cordis、DSH profile 或宿主凭据库。
-已提供独立 HTTP 服务、网页管理、EAC 和原有十三个账号渠道；独立安装制品尚未发布。
+已提供独立 HTTP 服务、网页管理、EAC 和十个账号渠道；独立安装制品尚未发布。
 本阶段从完整仓库运行，暂不能仅复制本目录或将它单独作为 npm 包安装。
 
 ## 启动
@@ -36,10 +36,55 @@ npm run start:standalone -- --port 18900 --data-dir F:\ofm-data
 - `GET /health` 提供不含凭据的产品状态；推理接口与模型清单需要 `Authorization: Bearer <API Key>`。
 - 同一个数据目录只能启动一个本地服务实例。正常退出会清除 `service.lock`。
 - 异常退出后若锁仍存在，先检查锁文件记录的 PID，确认旧进程已停止，再移除该锁文件。
-- 只监听回环地址，不提供局域网访问。
+- 管理页面和管理 API 只监听回环地址；局域网推理需要显式开启独立中继。
 
 插件仍使用 `DSH_HOME/our-free-model` 或 `~/.dsh/our-free-model`，两者默认互不影响。
 不要主动把独立服务的 `OFM_HOME` 指向插件的数据目录。
+
+## 局域网推理
+
+首次启动默认关闭。可在本机管理接口中设置，或通过 CLI 显式开启并保存：
+
+```powershell
+npm run start:standalone -- --lan --lan-port 18901
+npm run start:standalone -- --no-lan
+```
+
+`--lan-port` 单独使用只保存端口，不启用中继。省略开关时沿用已保存设置。
+中继监听 `0.0.0.0`，仅转发模型清单及 Chat Completions、Responses、Messages、
+Messages count_tokens 推理路径（支持 `/v1` 前缀和无前缀形式）。
+流式响应与取消沿用本机推理实现。`/`、`/health`、页面资源和所有管理路径均不转发；
+OPTIONS 只返回 CORS 预检，不返回管理数据。
+
+LAN 客户端使用本机管理接口单独生成的 LAN Key，不能使用或索取本机 `forwardKey`。
+LAN Key 保存在当前独立目录的 `settings.json` 的 `standaloneLanKey` 字段中；
+关闭中继、正常退出和重启均保留该密钥。轮换 LAN Key 立即使旧 LAN Key 失效，
+本机 API Key 和管理会话继续可用。轮换本机 API Key 后中继自动使用新本机密钥。
+只把 LAN Key 交给可信客户端，并在需要时通过防火墙限制访问来源。
+
+本机管理 API 使用已有会话或本机 Bearer Key，契约如下：
+
+| 接口 | 请求或返回 |
+| --- | --- |
+| `POST /api/management/settings` | 接受 `standaloneLanEnabled`（布尔）和 `standaloneLanPort`（0 到 65535 整数）；返回 `settings` 和 `lan` |
+| `GET /api/management/summary` | `settings` 包含上述设置；`lan` 包含运行状态，不含密钥 |
+| `GET /api/management/lan/key` | `{key}`；尚未生成时为空字符串 |
+| `POST /api/management/lan/key/rotate` | 请求必须恰好是 `{confirm:true}`；返回新 `{key}` |
+
+`lan` 字段为 `{enabled,running,host,requestedPort,port,addresses,baseUrls,error}`。
+`enabled` 表示保存的 LAN 意愿；服务总开关关闭时它可以为 true，而 `running` 为 false。
+`requestedPort` 为期望端口，0 表示每次启动自动分配；实际端口只出现在 `port`，
+不会写回覆盖期望端口，停止时为 null。固定端口被占用时保留设置，
+`running:false` 且 `error` 给出失败代码；释放端口后重新应用设置可重试。
+关闭服务总开关或 LAN 开关会立即停止中继并释放端口，正常退出也会释放端口。
+`baseUrls` 为检测到的本机网卡 IPv4 地址及实际端口，切换网络后重新读取摘要即可更新。
+未知字段、自定义监听 host、目标地址和客户端提交的密钥均不接受。
+
+这只解决 issue #351 的 LAN 推理接入。issue #216 的 Docker / FPK / NAS
+远程管理部署仍未实现：管理监听器和 Host 信任围栏仍限 loopback，
+不支持 `--host`、`OFM_ALLOW_NON_LOOPBACK` 或 `OFM_TRUSTED_HOSTS` 放宽管理访问。
+容器映射中继端口可供已配置的推理客户端连接，但不能据此从 LAN 打开管理页，
+也没有提供容器镜像、FPK 包或容器内账号 OAuth 登录适配。
 
 ## 当前接口与渠道
 
@@ -48,7 +93,7 @@ npm run start:standalone -- --port 18900 --data-dir F:\ofm-data
 - `POST /v1/responses`，包括流式与非流式请求
 - 匿名免费模型与 Kilo 免费模型
 - EAC 原 GitHub 授权、签名请求和资源池；独立应用使用自己的授权文件
-- CodeArts、CodeBuddy（页面显示 WorkBuddy 国内版）、WorkBuddy 国际版、LobsterAI、
+- CodeArts（华为云）、LobsterAI、
   Qoder、Qoder 中国版、TRAE、Cline、Loomy、Raccoon、MiniMax Code、ZCode、Gemini
 - 原渠道登录、账号池和轮换、续期、模型开关、每日签到、积分锁定、账本及备份
 - 本地模型缓存、用量统计、周期刷新、请求取消与退出清理
@@ -101,7 +146,7 @@ node scripts/build-standalone-ui.mjs --check
 - **用量统计**：累计用户回合、物理请求、输入/输出 Token、失败与恢复回合，
   最近 7/14/30 个本地自然日趋势（默认 14 天），以及按模型搜索、排序和每页 20 条统计。
   历史估算有明确说明，未知性能显示“—”；读取和刷新统计不发送推理请求。
-- **免费账号渠道**：十三张原渠道卡片、登录与账号管理；渠道用量、请求日志、
+- **免费账号渠道**：十张渠道卡片、登录与账号管理；渠道用量、请求日志、
   供应商启停、永久积分锁定、昵称、账号优先级、限流重置与备份导入导出。
 - **EAC 协付渠道**：GitHub 授权、状态、取消、退出和资源池。授权页面由用户打开并完成。
 - **服务设置**：暂停或恢复推理、地区模型、断流恢复、输出上限、刷新间隔和自动探测。
@@ -144,6 +189,7 @@ npm run test:standalone
 npm run test:management
 npm run test:standalone-channels
 node scripts/channel-network-test.mjs
+node scripts/standalone-lan-test.mjs
 npm run test:contributor
 ```
 

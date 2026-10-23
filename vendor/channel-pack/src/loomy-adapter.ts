@@ -3,13 +3,6 @@
  *
  * ## 协议
  *
- * 实测（2026-09-26）`POST {apiBase}/chat/completions` 是**标准 OpenAI 兼容
- * + 标准 SSE**：`data:` 帧 + 空 `data:` 终止帧，思考在 `delta.reasoning_content`，
- * **无加密、无信封、无格式转换**。与 qoder 同形，故消息序列化与 SSE 消费
- * 直接复用 `src/openai-compat.ts` —— 那是为这种形态抽的共享层，
- * **新增** provider 用它正是其设计意图（AGENTS.md 只禁止拿它去重构
- * buddy/lobsterai 的既有实现）。
- *
  * ⚠️ **认证头与业务端点不同**：chat 端点**只认** `Authorization: Bearer`，
  * 而 `/models`、`/points/*` 只认 `token`。故 `stream()` 用
  * `loomyChatHeaders()`（两个都发），`listModels()` 用 `loomyBusinessHeaders()`。
@@ -22,6 +15,7 @@ import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { nextUtc8DayStartMs } from './model-queue.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
@@ -211,7 +205,11 @@ export interface LoomyAdapterOptions {
    * ⚠️ Loomy **没有 refresh 端点**，故实现只做**有效性探测**并在失效时抛错，
    * 不会（也无法）续期。
    */
-  refresh: () => Promise<void>
+  refresh: (accountId?: string) => Promise<LoomyCredential | void>
+  nextAccount?: (
+    modelId: string,
+    tried: ReadonlySet<string>,
+  ) => Promise<{ accountId: string; credential: LoomyCredential } | undefined>
   /** 拉取远端模型目录；失败时适配器回退兜底表。 */
   fetchRemoteModels?: () => Promise<LoomyRemoteModel[]>
   /** 读取图片附件的原始字节（内联为 data URL 用）。 */
@@ -370,13 +368,6 @@ export class LoomyAdapter extends LlmAdapter {
     }
   }
 
-  /**
-   * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
-   * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本
-   * 基类尚未提供该方法，缺少时会在每轮请求开始时抛
-   * `registration.adapter.prepareCall is not a function`。
-   * 与 `BuddyAdapter` / `QoderAdapter` 同款 shim。
-   */
   async prepareCall(
     provider: string,
     model: string,
@@ -421,9 +412,11 @@ export class LoomyAdapter extends LlmAdapter {
     // ⚠️ **必须把模型 id 传给选号器**：Loomy 的选号要先按「该模型是否受限」
     // 过滤账号（限流按模型记），再按余额分档。传空串会让模型级限流失效。
     let credential = await this.options.resolveCredential(options.model)
+    let accountId = credential === undefined ? undefined
+      : await this.options.accountPool?.findAccountIdByCredential(this.product.id, credential.access_token)
     if (credential === undefined || isLoomyExpired(credential)) {
-      await this.options.refresh()
-      credential = await this.options.resolveCredential(options.model)
+      credential = await this.options.refresh(accountId || undefined)
+        ?? await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('loomy: no usable credential; log in first', 'MISSING_CREDENTIAL')
@@ -443,10 +436,6 @@ export class LoomyAdapter extends LlmAdapter {
 
     /**
      * 思考档位：仅当**该模型确实声明了它**时才下发。
-     *
-     * ⚠️ 字段名是 `reasoning_effort`（与远端声明的 `reasoning_efforts` /
-     * `default_reasoning_effort` 同源，也与 OpenAI 标准一致）。
-     * 本插件其余适配器同样用它（如 `buddy-adapter.ts`）。
      *
      * ⚠️ **必须校验档位在该模型的 `efforts` 内**：DSH 会把用户选的档位直接透传，
      * 给一个远端不认的值比不给更糟。校验不过时**静默不下发**（退回服务端默认档），
@@ -511,31 +500,64 @@ export class LoomyAdapter extends LlmAdapter {
       }
     }
 
-    let response = await send(credential.access_token)
-    // 401/403 时尝试刷新一次（Loomy 无 refresh 端点，故这里多半会抛错，
-    // 但保留该路径以便将来上游开放续期时自动受益）。
-    if (response.status === 401 || response.status === 403) {
-      await this.options.refresh()
-      const refreshed = await this.options.resolveCredential(options.model)
-      if (refreshed === undefined || refreshed.access_token.length === 0) {
-        throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status })
+    const tried = new Set<string>()
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (accountId) tried.add(accountId)
+      let emitted = false
+      try {
+        let response = await send(credential.access_token)
+        if (response.status === 401 || response.status === 403) {
+          await response.body?.cancel()
+          credential = await this.options.refresh(accountId || undefined)
+            ?? await this.options.resolveCredential(options.model)
+          if (credential === undefined || credential.access_token.length === 0) {
+            throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status })
+          }
+          response = await send(credential.access_token)
+        }
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => '')
+          let quota = response.status === 402
+          try { quota ||= isLoomyQuotaError(JSON.parse(errorText)) } catch {}
+          throw new LlmError(
+            `loomy: ${errorDetail(errorText)}`,
+            quota ? 'QUOTA_EXCEEDED' : httpErrorCode(response.status),
+            { status: response.status },
+          )
+        }
+        for await (const chunk of consumeOpenAiSse(response, { signal: options.signal }, {
+          label: 'loomy',
+          firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+          chunkTimeoutMs: resolveChunkTimeoutMs(),
+          isQuotaError: isLoomyQuotaError,
+          ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+        })) {
+          emitted = true
+          yield chunk
+        }
+        return
+      } catch (error) {
+        if (options.signal?.aborted || !(error instanceof LlmError) || error.code !== 'QUOTA_EXCEEDED') throw error
+        if (accountId) {
+          await this.options.accountPool?.updateModelRateLimit(accountId, options.model, nextUtc8DayStartMs())
+        }
+        if (emitted || attempt === 2 || this.options.nextAccount === undefined) throw error
+        const next = await this.options.nextAccount(options.model, tried)
+        if (next === undefined || tried.has(next.accountId)) throw error
+        accountId = next.accountId
+        credential = next.credential
+        if (isLoomyExpired(credential)) credential = await this.options.refresh(accountId) ?? credential
       }
-      response = await send(refreshed.access_token)
     }
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
-    }
-
-    // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。
-    yield* consumeOpenAiSse(response, { signal: options.signal }, {
-      label: 'loomy',
-      firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
-      chunkTimeoutMs: resolveChunkTimeoutMs(),
-      ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
-    })
   }
+}
+
+function isLoomyQuotaError(data: Record<string, unknown>): boolean {
+  const error = typeof data.error === 'object' && data.error !== null
+    ? data.error as Record<string, unknown>
+    : data
+  return String(error.code ?? data.code) === '402'
+    || /积分不足|余额不足|insufficient[_\s]+(?:points|balance|credits)/i.test(String(error.message ?? error.msg ?? ''))
 }
 
 /** 首 token 超时（毫秒）；可用环境变量覆盖（与其余适配器同约定）。 */

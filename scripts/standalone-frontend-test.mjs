@@ -36,6 +36,32 @@ for (const [saved, prefersDark, expected, storageUnavailable] of [
     `主题初始化：保存值=${saved}，系统深色=${prefersDark}，存储不可用=${!!storageUnavailable}`)
 }
 assert.match(html, /type="module".+src="\/assets\/app.js"/)
+// 侧边栏靠基础层的 position: sticky 吸附。主题层（[data-theme] 前缀）若给它补 position，
+// 特异性更高就会覆盖 sticky，切到深色后整条侧边栏跟着主界面一起滚走。
+// 只允许基础层与窄屏断点声明 .sidebar 的 position，主题层一律不许。
+const sheet = fs.readFileSync(new URL('app.css', web), 'utf8')
+const rules = [...sheet.matchAll(/([^{}@]+)\{([^{}]*)\}/g)].map(([, selectors, body]) => ({ selectors: selectors.trim(), body }))
+// 只看作用在侧边栏"元素本身"的选择器；::before 这类装饰伪元素的 position 不受影响。
+const isSidebarElement = selectors => selectors.split(',')
+  .map(part => part.replace(/\[[^\]]*\]/g, '').trim())
+  .some(part => part === '.sidebar' || part.endsWith('> .sidebar'))
+const themedSidebarPosition = rules.filter(rule =>
+  /\[data-theme/.test(rule.selectors) && isSidebarElement(rule.selectors) && /position\s*:/.test(rule.body))
+assert.deepEqual(themedSidebarPosition.map(rule => rule.selectors), [],
+  '主题层不得声明 .sidebar 的 position，否则会覆盖基础层的 sticky')
+const baseSidebar = rules.find(rule => rule.selectors === '.sidebar' && /position\s*:\s*sticky/.test(rule.body))
+assert.ok(baseSidebar, '侧边栏必须由基础层保持 position: sticky')
+// 构建会压缩选择器（`.app-shell > *:not(.sidebar)` 会变成 `.app-shell>:not(.sidebar)`），
+// 所以按语义判断：主题层里任何覆盖 .app-shell 直接子元素的定位规则都必须排除侧边栏。
+const themedShellChild = rules.filter(rule =>
+  /\[data-theme/.test(rule.selectors) && /\.app-shell\s*:?\s*>/.test(rule.selectors) && /position\s*:/.test(rule.body))
+assert.ok(themedShellChild.length > 0, '应当保留主题层对 .app-shell 子元素的层级修正')
+for (const rule of themedShellChild) {
+  assert.ok(/not\(\s*\.sidebar\s*\)/.test(rule.selectors),
+    `主题层覆盖 .app-shell 子元素的定位时必须排除侧边栏：${rule.selectors.slice(0, 90)}`)
+}
+assert.ok(/::view-transition-new\(root\)/.test(sheet), '主题切换必须有新主题的扩散层')
+assert.ok(/clip-path:\s*circle\(/.test(sheet), '扩散必须用圆形 clip-path')
 assert.ok(!html.includes('channels-'), '渠道不应在登录首屏预加载')
 assert.ok(!html.includes('models-'), '模型页面不应在登录首屏预加载')
 assert.ok(!html.includes('usage-'), '用量页面不应在登录首屏预加载')
@@ -67,7 +93,7 @@ assert.equal(empty.requests, 0)
 assert.equal(empty.recoveredTurns, 0)
 assert.deepEqual(empty.samples, [])
 const catalog = Array.from({ length: 1000 }, (_, index) => ({
-  id: `provider/model-${index}`, name: `测试模型 ${index}`, channel: index % 2 ? 'buddy' : 'kilo',
+  id: `provider/model-${index}`, name: `测试模型 ${index}`, channel: index % 2 ? 'lobsterai' : 'kilo',
   vision: index % 3 === 0, reasoning: index % 5 === 0, routable: index % 7 !== 0,
   availability: index % 2 ? 'listed' : 'available',
 }))
@@ -77,10 +103,10 @@ assert.equal(filterModels(catalog, { search: '  PROVIDER/MODEL-999  ' })[0].id, 
 assert.equal(filterModels(catalog, { search: '测试模型 999' }).length, 1)
 assert.equal(filterModels(catalog, { channel: 'eac' }).length, 0)
 assert.ok(filterModels(catalog, { capability: 'text' }).every(model => !model.vision))
-const combined = filterModels(catalog, { channel: 'buddy', capability: 'reasoning', availability: 'listed', access: 'routable' })
+const combined = filterModels(catalog, { channel: 'lobsterai', capability: 'reasoning', availability: 'listed', access: 'routable' })
 assert.ok(combined.length > 0)
-assert.ok(combined.every(model => model.channel === 'buddy' && model.reasoning && model.routable && model.availability === 'listed'))
-assert.equal(filterModels(catalog, { channel: 'buddy', availability: 'available' }).length, 0)
+assert.ok(combined.every(model => model.channel === 'lobsterai' && model.reasoning && model.routable && model.availability === 'listed'))
+assert.equal(filterModels(catalog, { channel: 'lobsterai', availability: 'available' }).length, 0)
 assert.equal(filterModels(catalog, { access: 'hidden' }).length + filterModels(catalog, { access: 'routable' }).length, catalog.length)
 assert.equal(filterModels([{ id: 'unknown', name: '未知状态', routable: false }], { availability: 'unknown' }).length, 1)
 assert.deepEqual(catalog, baseline, '视图筛选不得改变目录、公开状态或模型开关')
@@ -136,6 +162,7 @@ assert.equal(cumulative.logicalEstimated, true)
 assert.equal(cumulative.requestFailures, 3)
 const savedSettings = {
   enabled: true, exposeRegionModels: true, streamRecovery: true, standaloneProbe: false,
+  hideFreeModels: false, hideEacModels: false,
   defaultMaxTokens: 32768, probeIntervalMinutes: 15,
 }
 const cleanDraft = settingsDraft(savedSettings)
@@ -174,6 +201,7 @@ assert.equal(settingsChanged({ ...editedDraft, defaultMaxTokens: '32768', enable
   '改回原值不应继续提示未保存')
 assert.deepEqual(savedSettings, {
   enabled: true, exposeRegionModels: true, streamRecovery: true, standaloneProbe: false,
+  hideFreeModels: false, hideEacModels: false,
   defaultMaxTokens: 32768, probeIntervalMinutes: 15,
 }, '草稿操作不能改动输入配置')
 await verifySettingsHost()
