@@ -28839,7 +28839,7 @@ var AccountPool = class {
    */
   async findAccountIdByCredential(provider, identity) {
     if (identity.length === 0) return "";
-    const identifierKey = "access_token";
+    const identifierKey = provider === "codearts" ? "access_key_id" : "access_token";
     for (const entry of this.readAccounts()) {
       if (entry.provider !== provider || !entry.enabled) continue;
       const resolved = await this.resolveCredentialByRef(entry.credentialRef);
