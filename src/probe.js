@@ -57,13 +57,6 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
 
   let firstDelta
   let streamError
-  // Transport retries (issue: ECONNRESET via an env HTTP proxy) — bounded, jittered, and
-  // **only** for failures that produced no upstream answer at all. A business answer
-  // (throttled / region / model refusal) is never retried: that would burn quota.
-  const TRANSPORT_BACKOFF_MS = [400, 1200]
-  for (let attempt = 0; ; attempt++) {
-  firstDelta = undefined
-  streamError = undefined
   try {
     await postStreamed({
       path: endpointFor(model.id),
@@ -98,22 +91,11 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
     }
     return { state: STATE.available, latencyMs: Date.now() - started, ttftMs: firstDelta === undefined ? undefined : firstDelta - started }
   } catch (error) {
-    const state = stateOf(error)
-    // No parsed answer and no HTTP status => the failure is in the transport itself.
-    // A transport failure is one that produced no HTTP answer at all. The socket code
-    // (ECONNRESET / ETIMEDOUT / ...) lives on `error.code` too, so the test must be
-    // "no business verdict" (unknown) + "no HTTP status", not "no code".
-    const transport = state === STATE.unknown && error?.status === undefined
-    if (!transport || attempt >= TRANSPORT_BACKOFF_MS.length) {
-      return {
-        state,
-        detail: typeof error?.message === 'string' ? error.message.slice(0, 200) : String(error),
-        latencyMs: Date.now() - started,
-        attempts: attempt + 1,
-      }
+    return {
+      state: stateOf(error),
+      detail: typeof error?.message === 'string' ? error.message.slice(0, 200) : String(error),
+      latencyMs: Date.now() - started,
     }
-    await new Promise(resolve => setTimeout(resolve, TRANSPORT_BACKOFF_MS[attempt] + Math.floor(Math.random() * 150)))
-  }
   }
 }
 
@@ -237,27 +219,7 @@ export async function detectEgress({ signal, timeoutMs = 8000 } = {}) {
  * periodic loop holds *whole rounds* off while a quota backoff window is open
  * (the caller's concern, see index.js) instead of truncating this one.
  */
-/**
- * One-time environment diagnostic (never changes behaviour): when the host exports
- * NODE_USE_ENV_PROXY=1 and an HTTP(S)_PROXY, Node's fetch gains an env proxy agent,
- * while the free lane is direct by design. Tunnelled TLS handshakes get reset and
- * surface as ECONNRESET — a network/environment problem, not an unavailable model.
- * Reported once per process; the UI carries the same explanation per affected model.
- */
-let envProxyReported = false
-export function envProxyDiagnostic(env = process.env) {
-  if (envProxyReported) return null
-  envProxyReported = true
-  if (env.NODE_USE_ENV_PROXY !== '1') return null
-  const proxy = env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy
-  if (proxy === undefined || proxy === '') return null
-  return `our-free-model: 当前进程受环境代理影响（NODE_USE_ENV_PROXY=1，代理 ${proxy}），而免费车道按设计为直连；经 HTTP 代理隧道时 TLS 握手可能被重置（表现为 ECONNRESET）——这属于网络/环境问题，不是模型不可用。`
-}
-
 export async function probeCatalog(models, options = {}, onResult = () => {}, concurrency = 2) {
-  const diagnostic = envProxyDiagnostic()
-  if (diagnostic !== null && typeof options.log === 'function') options.log(diagnostic)
-  else if (diagnostic !== null) console.warn(diagnostic)
   const results = {}
   let cursor = 0
   const workers = Array.from({ length: Math.max(1, Math.min(concurrency, models.length)) }, async () => {
