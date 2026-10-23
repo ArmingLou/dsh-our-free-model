@@ -741,6 +741,7 @@ export interface ChannelPackRpcConfig {
 export function registerChannelPackRpc(
   ctx: Context,
   pool: AccountPool,
+  codearts: CodeArtsAuth,
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
   /** Qoder **中国版**实例（与 `qoder` 同协议、不同 product；RPC 分支按注册表分派）。 */

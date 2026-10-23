@@ -1668,7 +1668,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 丢的却是「下一轮工具调用能不能带上签名」。
   ctx.effect(() => () => { void geminiSigStore.flush().catch(() => {}) })
 
-  registerChannelPackRpc(ctx, pool, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
+  registerChannelPackRpc(ctx, pool, codearts, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
     ...config,
   })
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已

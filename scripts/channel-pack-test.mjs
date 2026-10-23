@@ -119,7 +119,7 @@ try {
   apply(ctx, { disableOpencode: true })
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(adapters.has('opencode'), false, 'disabled account provider is not registered')
-  assert.equal(adapters.size, 10, 'all other account providers remain registered')
+  assert.equal(adapters.size, 11, 'all other account providers remain registered')
   verifyChannelImagePricing(adapters)
   console.log('ok  十渠道同步图片计价：缺失及默认方法兜底，厂商计价优先，重复图片与已卸载图片正确计数')
   assert.equal(writes.length, 0, 'mount neither creates nor deletes credentials')

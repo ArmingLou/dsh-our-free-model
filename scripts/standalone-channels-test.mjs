@@ -170,7 +170,7 @@ try {
   await service.ready
   key = JSON.parse(fs.readFileSync(service.keyFile)).forwardKey
   await check('十个真实渠道注册，独立目录、统一模型目录和机读能力可用', async () => {
-    assert.equal(service.channels.providers.length, 10)
+    assert.equal(service.channels.providers.length, 11)
     assert.equal(service.channels.providers.includes('opencode'), false)
     assert.equal((await rpc('account.list', { provider: 'cline' })).accounts.length, 1)
     const { value } = await api('/v1/models')

@@ -57216,7 +57216,7 @@ function providerIdsOf(llm, modelAdapters) {
   const keys = Object.keys(modelAdapters ?? {});
   return keys.length > 0 ? keys.map((id) => ({ id })) : void 0;
 }
-function registerChannelPackRpc(ctx, pool, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config = {}) {
+function registerChannelPackRpc(ctx, pool, codearts, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config = {}) {
   ctx.inject(["connection"], (connectionCtx) => {
     registerChannelPackEndpoints(
       connectionCtx,
@@ -57264,7 +57264,7 @@ function parseCodeArtsCredential(raw) {
     return void 0;
   }
 }
-function registerChannelPackEndpoints(ctx, pool, codearts2, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config = {}) {
+function registerChannelPackEndpoints(ctx, pool, codearts, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config = {}) {
   const connection = ctx.connection ?? ctx.get("connection");
   if (!connection || typeof connection.fetch?.register !== "function") {
     ctx.logger.warn("[channel-pack] connection.fetch not available, RPC endpoints not registered");
@@ -57460,7 +57460,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts2, lobsterai, qoder, qo
         const suffix = shortId().toUpperCase();
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`;
         if (provider === "codearts") {
-          const started = await codearts2.startLogin({ refName });
+          const started = await codearts.startLogin({ refName });
           await pool.addAccount({
             id,
             provider: "codearts",
@@ -57862,7 +57862,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts2, lobsterai, qoder, qo
           if (!entry) throw new Error(`Account ${req.accountId} not found`);
           switch (entry.provider) {
             case "codearts":
-              await codearts2.refreshAccountCredential(entry.credentialRef, pool, entry.id);
+              await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id);
               break;
             case LOBSTERAI.id:
               await lobsterai.refreshAccountCredential(entry.credentialRef, pool, entry.id);
@@ -64576,7 +64576,7 @@ function apply(ctx, config = {}) {
       "QUOTA_EXCEEDED"
     );
   };
-  const codearts2 = registerCodeArtsLlm(ctx, {
+  const codearts = registerCodeArtsLlm(ctx, {
     credentialRef: credentialRef15(CODEARTS_CREDENTIAL_REF),
     resolveCredential: async () => {
       const available2 = await pool.getAvailableAccount("codearts", "");
@@ -65330,7 +65330,7 @@ function apply(ctx, config = {}) {
   };
   const modelAdapters = {
     // 服务实例 `service` 不同名，故这里可以简写）。
-    codearts: pruned(PROVIDER, codearts2),
+    codearts: pruned(PROVIDER, codearts),
     lobsterai: pruned(LOBSTERAI.id, lobsteraiAdapter),
     qoder: pruned(QODER.id, qoderAdapter),
     qodercn: pruned(QODER_CN.id, qoderCnAdapter),
@@ -65347,7 +65347,7 @@ function apply(ctx, config = {}) {
     void geminiSigStore.flush().catch(() => {
     });
   });
-  registerChannelPackRpc(ctx, pool, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
+  registerChannelPackRpc(ctx, pool, codearts, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
     ...config
   });
   mountOpenAiGateway(ctx, pool);
