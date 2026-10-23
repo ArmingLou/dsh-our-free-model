@@ -84,7 +84,6 @@ async function setup(variant, options = {}) {
   await context.addInitScript(({ theme }) => {
     try {
       localStorage.setItem('ofm-theme', theme); localStorage.setItem('ofm.tab', 'upgrade')
-      const date = new Date(); localStorage.setItem('ofm.sponsor.last-shown.v1', date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0'))
     } catch {}
     window.fixtureTransitionCalls = 0
     const transition = document.startViewTransition?.bind(document)
