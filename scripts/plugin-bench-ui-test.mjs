@@ -123,7 +123,14 @@ await check('listing stays selectable and does not imply verified inference; man
   const roster = flatten(Roster({ summary: { catalog: [model], settings: {} }, t: app.t }))
   assert.ok(roster.includes('可选模型')); assert.ok(roster.some(node => node?.type === ModelCard))
   nodes = flatten(ModelCard({ ...props, model: { ...model, availabilitySource: 'manual', availability: 'unknown', detail: 'No normal finish' } }))
-  assert.ok(nodes.includes('No normal finish')); assert.ok(!nodes.includes('可用'))
+  // Behaviour change (2026-10-23): the honest hint is now the main text and the raw upstream
+  // detail moved into the tooltip. The assertion is RELOCATED and STRENGTHENED (the negative
+  // guard is new) — it is not relaxed: the raw text must still be reachable, just not as the
+  // verdict. See hint.transport / the manual branch in client.js.
+  assert.ok(nodes.includes(app.t('hint.transport')), 'manual transport failure leads with the honest hint')
+  assert.ok(nodes.some(node => node?.props?.title === 'No normal finish'), 'raw upstream detail is kept in the tooltip')
+  assert.ok(!nodes.includes('No normal finish'), 'raw upstream detail is no longer the main text')
+  assert.ok(!nodes.includes('可用'))
   nodes = flatten(ModelCard({ ...props, model: { ...model, availabilitySource: 'manual', availability: 'available', probedAt: Date.now(), ttftMs: 321 } }))
   assert.ok(nodes.includes('最近测量')); assert.ok(nodes.some(node => node?.children?.includes(321)))
 })

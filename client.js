@@ -56,8 +56,8 @@ window.__ModuleLoader__.load({
         'roster.selectable': '可选模型',
         'hint.listed': '来自渠道目录，未做逐模型推理测试；不代表对话或工具调用成功。',
         'hint.region': '该模型按出口地区放行。开启网络代理后，插件会在下一次探测自动把它移入可用分组。',
-        'hint.quota': '上游免费额度已耗尽（FreeUsageLimitError）：这是**上游配额**问题，不是模型或插件故障；等上游配额窗口恢复后重新探测即可。',
-        'hint.transport': '未能连通上游（网络或代理问题），**不代表模型不可用**。若进程受环境代理影响（NODE_USE_ENV_PROXY 且设置了 HTTPS_PROXY），经 HTTP 代理隧道时 TLS 握手可能被重置并表现为 ECONNRESET —— 这属于网络/环境问题，免费车道按设计为直连。',
+        'hint.quota': '上游免费额度已耗尽（FreeUsageLimitError）：这是上游配额问题，不是模型或插件故障；等上游配额窗口恢复后重新探测即可。',
+        'hint.transport': '本次未能取得上游答复，不代表模型不可用；可能是网络或代理环境问题，请稍后重试。',
         'hint.unknown': '尚未探测，默认保持可达。',
         'hint.hidden': '探测显示网关点名了它却不路由它，因此已从模型选择器中移除；某一次探测重新通过，它会自己回来。',
         'hint.sharedBudget': '该模型思考不可关闭：思考与可见回答共用同一份额度，档位越低留给正文的越少。',
@@ -757,7 +757,7 @@ window.__ModuleLoader__.load({
         'hint.listed': 'Listed by the channel; inference has not been tested. This does not confirm chat or tool use.',
         'hint.region': 'This model is gated by egress country. Once a proxy changes your egress, the next probe moves it into the available group by itself.',
         'hint.quota': 'The upstream free quota is exhausted (FreeUsageLimitError). This is an upstream quota limit, not a model or plugin failure; probe again once the upstream quota window resets.',
-        'hint.transport': 'Could not reach the upstream (network or proxy problem) — this does not mean the model is unavailable. When the process runs behind an env HTTP proxy (NODE_USE_ENV_PROXY with HTTPS_PROXY set), the TLS handshake can be reset and surface as ECONNRESET; that is an environment issue — the free lane is direct by design.',
+        'hint.transport': 'No answer was received from the upstream this time — this does not mean the model is unavailable; it may be a network or proxy environment problem. Try again later.',
         'hint.unknown': 'Not probed yet, so it stays reachable.',
         'hint.hidden': 'The gateway names it but refuses to route it, so it is out of the model picker. It returns by itself as soon as a probe gets through.',
         'hint.sharedBudget': 'Thinking cannot be switched off on this model, so thinking and the visible answer share one ceiling — a lower rung leaves the answer less room.',
@@ -2931,7 +2931,12 @@ window.__ModuleLoader__.load({
                 eacLogin.busy ? t('eac.starting') : t('eac.login'))))
           : null,
         listed ? h('p', { className: 'ofm_note' }, t('hint.listed'))
-          : manual && m.availability !== 'available' ? h('p', { className: 'ofm_note' }, m.detail || t(stateKey))
+          : manual && m.availability !== 'available' ? h('p', { className: 'ofm_note', title: m.detail ?? '' },
+              m.availability === 'throttled' ? t('hint.quota')
+                : m.availability === 'unavailable' ? t('hint.hidden')
+                  : m.availability === 'region-blocked' ? t('hint.region')
+                    : m.availability === 'unknown' ? t('hint.transport')
+                      : t(stateKey))
           : m.availability === 'region-blocked' ? h('p', { className: 'ofm_note' }, t('hint.region'))
           : m.availability === 'throttled' ? h('p', { className: 'ofm_note', title: m.detail ?? '' }, t('hint.quota'))
           : m.availability === 'unknown' && m.detail ? h('p', { className: 'ofm_note', title: m.detail }, t('hint.transport'))

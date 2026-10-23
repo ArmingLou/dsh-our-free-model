@@ -360,7 +360,7 @@ export function createModelRuntime({
     } catch (error) {
       // Cancellation is a user action, not a fresh availability verdict. Other failures
       // remain unknown instead of silently banning a paid/region-gated route.
-      if (error?.code !== CODE.aborted) persist({ state: STATE.unknown, source: 'manual', at: Date.now(), detail: String(error?.message ?? error).slice(0, 200) })
+      if (error?.code !== CODE.aborted) persist({ state: error?.code === CODE.quota ? STATE.throttled : error?.code === CODE.region ? STATE.regionBlocked : STATE.unknown, source: 'manual', at: Date.now(), detail: String(error?.message ?? error).slice(0, 200) })
       throw error
     } finally {
       if (latestTests.get(id) === token) latestTests.delete(id)
