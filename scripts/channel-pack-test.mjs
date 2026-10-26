@@ -326,6 +326,221 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
     verifyQoderEffortOrder(qoderEffortsFor, sortEffortsByStrength)
     console.log('ok  qoder effort order: 档位按强度序下发（关闭思考在最左、max 在最右），未登记 id 排末尾且保持原序')
   }
+  {
+    const { QoderAdapter } = await import('../vendor/channel-pack/src/qoder-adapter.ts')
+    const { QoderEncryptedInfer } = await import('../vendor/channel-pack/src/qoder-wasm.ts')
+    const { QODER_CN } = await import('../vendor/channel-pack/src/qoder-product.ts')
+    const originalCreate = QoderEncryptedInfer.create
+    const originalEnvTimeout = process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+    const credential = token => ({
+      access_token: token, security_oauth_token: token, machine_id: `machine-${token}`, uid: `uid-${token}`,
+    })
+    const queueError = { code: '10605', message: JSON.stringify({ isQueued: true, retryAfterSeconds: 1 }) }
+    const envelope = body => `data: ${JSON.stringify({ body: JSON.stringify(body) })}\n\n`
+    const queuedSse = () => new Response(envelope(queueError))
+    const answerSse = text => new Response(envelope({
+      choices: [{ delta: { content: text }, finish_reason: 'stop' }],
+    }) + 'data: [DONE]\n\n')
+    const collect = async iterable => { const out = []; for await (const item of iterable) out.push(item); return out }
+    const qoderOptions = {
+      model: 'fixture-qoder-model',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    }
+
+    // 模拟不同账号的请求签名输入，专注验证重试状态机；不访问 Qoder 或消耗真实额度。
+    QoderEncryptedInfer.create = async () => ({ prepareInfer: () => ({ url: 'fixture:', headers: {}, body: '{}' }) })
+    const run = async ({
+      kind, candidates = ['b'], responseForAttempt, abortOnSleep = false,
+      addCandidateAfterLookup = false, product, queueTimeoutMs,
+    }) => {
+      const sent = []
+      const lookupSets = []
+      const marked = []
+      const switched = []
+      const rotationFailures = []
+      const providers = []
+      const slept = []
+      let nowMs = 1_000
+      const controller = new AbortController()
+      const accounts = candidates.map(id => ({
+        entry: { id },
+        credential: id === 'broken'
+          ? { access_token: `token-${id}`, security_oauth_token: `token-${id}`, machine_id: 'broken-machine' }
+          : credential(`token-${id}`),
+      }))
+      const lateAccount = addCandidateAfterLookup ? {
+        entry: { id: 'late-b' }, credential: credential('token-late-b'),
+      } : undefined
+      const adapter = new QoderAdapter({
+        credentialRef: 'FIXTURE',
+        resolveCredential: async () => credential('token-a'),
+        refresh: async () => { throw new Error('queue retry must not refresh credentials') },
+        currentAccountId: () => 'a',
+        queueAccountIdForCredential: async current => current.access_token === 'token-a' ? 'a' : undefined,
+        onQueueAccountSwitch: () => switched.push('queue-switch'),
+        onQueueRotationFailure: () => rotationFailures.push('no-alternative'),
+        now: () => nowMs,
+        product,
+        accountPool: {
+          getAvailableAccount: async (provider, _model, excluded) => {
+            providers.push(provider)
+            lookupSets.push([...excluded].sort())
+            const available = accounts.find(row => !excluded.has(row.entry.id))
+            if (available) return available
+            if (lateAccount && lookupSets.length >= 2 && !excluded.has(lateAccount.entry.id)) return lateAccount
+            return null
+          },
+          updateModelRateLimit: async (...args) => marked.push(args),
+        },
+        fetchImpl: async () => { throw new Error('overridden sendEncrypted should be used') },
+        sleep: async (ms, signal) => {
+          slept.push(ms)
+          nowMs += ms
+          if (abortOnSleep) controller.abort()
+        },
+      })
+      let attempt = 0
+      adapter.sendEncrypted = async (_request, _options) => {
+        const token = _request.body
+        sent.push(token)
+        return responseForAttempt(++attempt, token)
+      }
+      // 把 token 写进测试请求，便于断言每次发送实际使用了哪个账号。
+      QoderEncryptedInfer.create = async ({ user }) => ({
+        prepareInfer: () => ({ url: 'fixture:', headers: {}, body: user.securityOauthToken }),
+      })
+      let error
+      let chunks = []
+      const priorTimeout = process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      if (queueTimeoutMs !== undefined) process.env.DSH_QODER_QUEUE_TIMEOUT_MS = queueTimeoutMs
+      try { for await (const chunk of adapter.stream({ ...qoderOptions, signal: controller.signal })) chunks.push(chunk) }
+      catch (caught) { error = caught }
+      finally {
+        if (priorTimeout === undefined) delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+        else process.env.DSH_QODER_QUEUE_TIMEOUT_MS = priorTimeout
+      }
+      return { sent, lookupSets, providers, marked, switched, rotationFailures, slept, chunks, error, kind }
+    }
+
+    try {
+      // HTTP 403 排队：第 3 次排队后换到健康账号；略过缺少 uid 的坏条目，且不误写额度限制。
+      const http = await run({
+        kind: 'http', candidates: ['broken', 'b'],
+        responseForAttempt: (attempt, token) => {
+          if (token === 'token-a' && attempt <= 3) {
+            return new Response(JSON.stringify(queueError), { status: 403 })
+          }
+          return answerSse('http-rotated-ok')
+        },
+      })
+      assert.equal(http.error, undefined)
+      assert.deepEqual(http.sent, ['token-a', 'token-a', 'token-a', 'token-b'])
+      assert.deepEqual(http.lookupSets, [['a'], ['a', 'broken']])
+      assert.deepEqual(http.switched, ['queue-switch'])
+      assert.deepEqual(http.marked, [], '排队不得被记录成额度耗尽')
+      assert.ok(http.chunks.some(row => row.type === 'text-delta' && row.text === 'http-rotated-ok'))
+
+      // HTTP 200 + SSE 内嵌排队：必须走同一换号逻辑，而不是落回通用重试。
+      const sse = await run({
+        kind: 'sse',
+        responseForAttempt: (attempt, token) => token === 'token-a' && attempt <= 3
+          ? queuedSse() : answerSse('sse-rotated-ok'),
+      })
+      assert.equal(sse.error, undefined)
+      assert.deepEqual(sse.sent, ['token-a', 'token-a', 'token-a', 'token-b'])
+      assert.deepEqual(sse.marked, [])
+      assert.ok(sse.chunks.some(row => row.type === 'text-delta' && row.text === 'sse-rotated-ok'))
+
+      // 新的备用账号在等待期间出现时，会在下一批检查中被当前请求发现。
+      const solo = await run({
+        kind: 'solo', candidates: [], addCandidateAfterLookup: true,
+        responseForAttempt: (attempt, token) => attempt <= 5
+          ? new Response(JSON.stringify({
+              ...queueError, message: JSON.stringify({ isQueued: true, retryAfterSeconds: 10 }),
+            }), { status: 403 }) : answerSse('solo-ok'),
+      })
+      assert.equal(solo.error, undefined)
+      assert.equal(solo.sent.length, 6)
+      assert.deepEqual(solo.sent.slice(0, 5), Array(5).fill('token-a'))
+      assert.equal(solo.sent[5], 'token-late-b')
+      assert.equal(solo.lookupSets.length, 2, '账号池会按有限批次重新检查新添加的账号')
+      assert.deepEqual(solo.slept, [10_000, 10_000, 10_000, 10_000])
+      assert.deepEqual(solo.marked, [])
+      assert.equal(solo.rotationFailures.length, 1, '无备用账号只提示一次，不重复刷屏')
+      assert.deepEqual(solo.switched, ['queue-switch'])
+
+      // 中国版使用同一状态机，但换号仍只从 qodercn 自己的账号池取。
+      const cn = await run({
+        kind: 'sse-cn', product: QODER_CN,
+        responseForAttempt: (attempt, token) => token === 'token-a' && attempt <= 3
+          ? queuedSse() : answerSse('cn-rotated-ok'),
+      })
+      assert.deepEqual(cn.sent, ['token-a', 'token-a', 'token-a', 'token-b'])
+      assert.ok(cn.providers.every(provider => provider === QODER_CN.id))
+
+      // 排队换号不能破坏原有额度换号：仍按真实账号标记额度，并重置其重试状态。
+      const quota = await run({
+        kind: 'quota',
+        responseForAttempt: (_attempt, token) => token === 'token-a'
+          ? new Response(JSON.stringify({ code: 110, message: 'Billing daily count exceeded' }), { status: 403 })
+          : answerSse('quota-rotated-ok'),
+      })
+      assert.equal(quota.error, undefined)
+      assert.deepEqual(quota.sent, ['token-a', 'token-b'])
+      assert.deepEqual(quota.marked.map(row => row[0]), ['a'])
+      assert.deepEqual(quota.switched, [])
+      assert.ok(quota.chunks.some(row => row.type === 'text-delta' && row.text === 'quota-rotated-ok'))
+
+      // 用户把等待上限设为 0 时，不能被默认值覆盖，也不应该睡眠或重发。
+      const zeroTimeout = await run({
+        kind: 'zero-timeout', queueTimeoutMs: '0',
+        responseForAttempt: () => new Response(JSON.stringify(queueError), { status: 403 }),
+      })
+      assert.equal(zeroTimeout.sent.length, 1)
+      assert.equal(zeroTimeout.error?.code, 'QUEUE')
+      assert.deepEqual(zeroTimeout.slept, [])
+      assert.deepEqual(zeroTimeout.lookupSets, [])
+
+      // 没有备用号时，间隔回查不能频繁打磁盘；约 20 秒重试一次并发现后加入的号。
+      const interval = await run({
+        kind: 'interval', candidates: [], addCandidateAfterLookup: true,
+        responseForAttempt: (attempt, token) => attempt <= 5
+          ? new Response(JSON.stringify({
+              ...queueError, message: JSON.stringify({ isQueued: true, retryAfterSeconds: 10 }),
+            }), { status: 403 }) : answerSse('interval-ok'),
+      })
+      assert.deepEqual(interval.slept, [10_000, 10_000, 10_000, 10_000])
+      assert.equal(interval.lookupSets.length, 2)
+      assert.equal(interval.sent.at(-1), 'token-late-b')
+
+      // 用户在排队间隔点击停止时要立即终止，不再发第二次请求。
+      const canceled = await run({
+        kind: 'abort', abortOnSleep: true,
+        responseForAttempt: () => new Response(JSON.stringify(queueError), { status: 403 }),
+      })
+      assert.equal(canceled.sent.length, 1)
+      assert.equal(canceled.error?.code, 'QUEUE')
+      assert.equal(canceled.lookupSets.length, 0)
+
+      // 已经向用户发出部分正文后遇到排队帧，不能重放整轮或切账号。
+      const partial = await run({
+        kind: 'partial', candidates: ['b'],
+        responseForAttempt: () => new Response(
+          envelope({ choices: [{ delta: { content: 'partial-answer' }, finish_reason: null }] })
+          + envelope(queueError),
+        ),
+      })
+      assert.ok(partial.error)
+      assert.equal(partial.sent.length, 1)
+      assert.equal(partial.lookupSets.length, 0)
+      assert.ok(partial.chunks.some(row => row.type === 'text-delta' && row.text === 'partial-answer'))
+      console.log('ok  source qoder: HTTP/SSE queue rotates after bounded grace, preserves quota/abort/output safety and skips unusable accounts')
+    } finally {
+      QoderEncryptedInfer.create = originalCreate
+      if (originalEnvTimeout === undefined) delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      else process.env.DSH_QODER_QUEUE_TIMEOUT_MS = originalEnvTimeout
+    }
+  }
   let hostValidate
   await realLlmInvariant.apply({ invariants: { register(_name, install) {
     install({ on(name, callback) { if (name === 'llm/stream') hostValidate = callback } },
