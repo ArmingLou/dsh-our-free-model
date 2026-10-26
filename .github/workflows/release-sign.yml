@@ -12,12 +12,9 @@ name: release-sign
 # release suite passes. Idempotent: on a consistent tree it writes nothing,
 # so the run triggered by its own push is a no-op.
 #
-# The pull_request case needs no counterpart. A PR that ships changed files
-# runs release-readiness red until the records exist, and that is by design —
-# the red check is what routes the merge to whoever holds the bypass, after
-# which this workflow signs the result. Handing PR branches a signed manifest
-# would instead require pushing bot commits into contributor branches, which
-# collides with the unattributed-changes approval rule on main.
+# PRs do not run a separate release-readiness job. After a merge this workflow
+# signs the result and validates the release suite before pushing the records.
+# It does not push signed manifests into contributor branches.
 on:
   push:
     branches: [main]
