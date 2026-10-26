@@ -12,9 +12,10 @@ name: release-sign
 # release suite passes. Idempotent: on a consistent tree it writes nothing,
 # so the run triggered by its own push is a no-op.
 #
-# PRs do not run a separate release-readiness job. After a merge this workflow
-# signs the result and validates the release suite before pushing the records.
-# It does not push signed manifests into contributor branches.
+# PR release-readiness validates the candidate's signed release records.
+# prepare-release can create a candidate-bound signed patch from trusted main
+# without executing candidate code. After a merge this workflow remains the
+# fallback that signs the result and validates it before pushing the records.
 on:
   push:
     branches: [main]
