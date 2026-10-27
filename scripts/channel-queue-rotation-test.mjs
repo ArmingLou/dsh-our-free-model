@@ -103,6 +103,36 @@ export async function verifyChannelQueueRotation() {
     assert.equal(options.currentAccountId(), 'a', 'shared default identity is unchanged')
   }
 
+  for (const change of ['disabled', 'limited', 'removed']) {
+    for (const backup of [true, false]) {
+      const pool = makePool('fixture', backup ? ['a', 'blocked', 'b'] : ['a'])
+      if (backup) pool.rows[1].entry.modelRateLimits.model = Date.now() + 60_000
+      const sent = []
+      const adapter = withQueueAccountRotation('fixture', {
+        accountPool: pool, resolveCredential: async () => credential('a'),
+      }, options => ({ async *stream() {
+        const value = await options.resolveCredential('model')
+        sent.push(value.access_token)
+        if (value.access_token === 'a') throw queued()
+        yield { text: 'ok' }
+      } }), { now: () => 0, sleep: async () => {
+        const current = pool.rows.find(row => row.entry.id === 'a')
+        if (!current) return
+        if (change === 'disabled') current.entry.enabled = false
+        if (change === 'limited') current.entry.modelRateLimits.model = Date.now() + 60_000
+        if (change === 'removed') pool.rows.splice(pool.rows.indexOf(current), 1)
+      } })
+      const result = collect(adapter.stream({ model: 'model' }))
+      if (backup) {
+        assert.equal((await result)[0].text, 'ok')
+        assert.deepEqual(sent, ['a', 'b'], `${change}: 失效账号不能继续发送，备用号仍按模型过滤`)
+      } else {
+        await assert.rejects(result, error => error.code === 'QUEUE')
+        assert.deepEqual(sent, ['a'], `${change}: 没有合规备用号时停止`)
+      }
+    }
+  }
+
   {
     const pool = makePool('fixture', ['a', 'b', 'c']), sent = [], refreshed = []
     const adapter = withQueueAccountRotation('fixture', {
