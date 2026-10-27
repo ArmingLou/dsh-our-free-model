@@ -877,6 +877,8 @@ export async function* consumeOpenAiSse(
       }
     }
   } finally {
+    // releaseLock 不会终止上游，必须先取消响应再允许换号重发。
+    await reader.cancel().catch(() => {})
     reader.releaseLock()
   }
 

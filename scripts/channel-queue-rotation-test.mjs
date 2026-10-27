@@ -243,8 +243,10 @@ export async function verifyChannelQueueRotation() {
   for (const provider of ['lobsterai', 'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'gemini', 'zcode', 'opencode']) {
     const module = await import(`../vendor/channel-pack/src/${provider}-adapter.ts`)
     const register = Object.entries(module).find(([name]) => /^register.*Llm$/.test(name))[1]
-    for (const transport of ['http', 'sse', 'json', 'json-sse']) {
+    for (const transport of ['http', 'sse', 'json', 'json-sse', 'open-sse', ...provider === 'raccoon' ? ['open-sse-partial'] : []]) {
       const pool = makePool(provider), sent = []
+      const canceled = []
+      let pending = false
       for (const row of pool.rows) {
         const token = `fixture-${row.entry.id}`
         row.credential = { ...credential(token), uid: row.entry.id, userid: row.entry.id, user_id: row.entry.id, phone: '13800000000', device_mid: 'fixture-device', machine_id: 'fixture-machine', device_id: 'fixture-device' }
@@ -252,6 +254,7 @@ export async function verifyChannelQueueRotation() {
       }
       const upstream = async (_url, init) => {
         if (init?.method !== 'POST') return Response.json({ data: [] })
+        if (transport.startsWith('open-sse')) assert.equal(pending, false, `${provider}: 新请求发出前必须取消旧响应`)
         const headers = [...new Headers(init?.headers).values()].join(' ')
         const id = headers.includes('fixture-a') ? 'a' : headers.includes('fixture-b') ? 'b' : undefined
         assert.ok(id, `${provider}: actual request carries account credential`)
@@ -262,6 +265,18 @@ export async function verifyChannelQueueRotation() {
           return response
         }
         const error = { error: { code: 'model_queued', retryAfterSeconds: 0 } }
+        if (transport.startsWith('open-sse')) {
+          pending = true
+          const text = (transport === 'open-sse-partial' ? 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n' : '')
+            + `event: error\ndata: ${JSON.stringify(error)}\n\n`
+          return new Response(new ReadableStream({
+            start(controller) { controller.enqueue(new TextEncoder().encode(text)) },
+            cancel() {
+              pending = false; canceled.push(id)
+              if (provider === 'raccoon' && canceled.length === 1) throw new Error('fixture cancel rejected')
+            },
+          }), { headers: { 'content-type': 'text/event-stream' } })
+        }
         if (transport === 'http') return Response.json(error, { status: 503 })
         if (transport === 'json') {
           const text = JSON.stringify(error), encoder = new TextEncoder()
@@ -292,9 +307,20 @@ export async function verifyChannelQueueRotation() {
       globalThis.fetch = upstream
       try {
         const call = await mounted.prepareCall(provider, model)
+        if (transport === 'open-sse-partial') {
+          const chunks = []
+          await assert.rejects(async () => {
+            for await (const chunk of call.stream({ model, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] })) chunks.push(chunk)
+          }, error => error instanceof ModelQueuedError)
+          assert.ok(chunks.some(chunk => chunk.text === 'partial'))
+          assert.deepEqual(sent, ['a'])
+          assert.deepEqual(canceled, ['a'], '输出后也要取消旧响应，但不得重发')
+          continue
+        }
         const chunks = await collect(call.stream({ model, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] }))
         assert.deepEqual(sent, ['a', 'a', 'a', 'b'], `${provider} ${transport}: rotates before output`)
         assert.ok(chunks.some(chunk => chunk.text === 'ok' || chunk.delta === 'ok'), `${provider} ${transport}: returns answer`)
+        if (transport === 'open-sse') assert.deepEqual(canceled, ['a', 'a', 'a'], `${provider}: 所有排队响应均已取消`)
       } finally { globalThis.fetch = fetchBefore }
     }
     console.log(`ok  channel queue registered ${provider}: HTTP + SSE + fragmented JSON 200 + mislabeled SSE`)

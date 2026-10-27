@@ -632,6 +632,7 @@ export async function* consumeMinimaxSse(
       for (const rawLine of lines) yield* processLine(rawLine)
     }
   } finally {
+    await reader.cancel().catch(() => {})
     reader.releaseLock?.()
   }
 

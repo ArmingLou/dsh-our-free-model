@@ -1567,6 +1567,7 @@ export class TraeAdapter extends LlmAdapter {
         }
       }
     } finally {
+      await reader.cancel().catch(() => {})
       reader.releaseLock()
     }
 

@@ -489,6 +489,26 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
       assert.deepEqual(cn.sent, ['token-a', 'token-a', 'token-a', 'token-b'])
       assert.ok(cn.providers.every(provider => provider === QODER_CN.id))
 
+      for (const product of [undefined, QODER_CN]) {
+        const canceled = []
+        let pending = false
+        const opened = await run({
+          kind: 'open-queue', product,
+          responseForAttempt: (_attempt, token) => {
+            assert.equal(pending, false, 'Qoder 重发前必须通过信封转换流取消旧上游')
+            if (token !== 'token-a') return answerSse('open-rotated-ok')
+            pending = true
+            return new Response(new ReadableStream({
+              start(controller) { controller.enqueue(new TextEncoder().encode(envelope(queueError))) },
+              cancel() { pending = false; canceled.push(token) },
+            }))
+          },
+        })
+        assert.equal(opened.error, undefined)
+        assert.deepEqual(opened.sent, ['token-a', 'token-a', 'token-a', 'token-b'])
+        assert.deepEqual(canceled, ['token-a', 'token-a', 'token-a'])
+      }
+
       // 排队换号不能破坏原有额度换号：仍按真实账号标记额度，并重置其重试状态。
       const quota = await run({
         kind: 'quota',

@@ -1470,6 +1470,7 @@ export class LobsteraiAdapter extends LlmAdapter {
         }
       }
     } finally {
+      await reader.cancel().catch(() => {})
       reader.releaseLock()
     }
 

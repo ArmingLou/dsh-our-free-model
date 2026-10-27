@@ -750,6 +750,7 @@ export async function* consumeGeminiSse(
       }
     }
   } finally {
+    await reader.cancel().catch(() => {})
     reader.releaseLock?.()
   }
 
