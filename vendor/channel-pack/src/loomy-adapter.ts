@@ -1,3 +1,5 @@
+import { withQueueAccountRotation } from './queue-rotation.js'
+import { checkQueuedResponse } from './model-queue.js'
 /**
  * Loomy LLM 适配器。
  *
@@ -486,7 +488,7 @@ export class LoomyAdapter extends LlmAdapter {
           headers: loomyChatHeaders(token),
           body: buildBody(),
           signal: options.signal,
-        })
+        }).then(checkQueuedResponse)
       } catch (error) {
         if (options.signal?.aborted) throw error
         if (isTransportError(error)) {
@@ -581,7 +583,7 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerLoomyLlm(ctx: Context, options: LoomyAdapterOptions): LoomyAdapter {
   const product = options.product ?? LOOMY
-  const adapter = new LoomyAdapter(options)
+  const adapter = withQueueAccountRotation(product.id, options, scoped => new LoomyAdapter(scoped))
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

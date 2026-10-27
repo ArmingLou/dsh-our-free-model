@@ -1,3 +1,5 @@
+import { withQueueAccountRotation, reportQueueSlot } from './queue-rotation.js'
+import { checkQueuedResponse, ModelQueuedError } from './model-queue.js'
 /**
  * 某模型的输入模态（`LlmModelInfo` / `LlmResolvedModelInfo` 共用）。
  *
@@ -137,7 +139,7 @@ export async function loadOpencodeCatalog(
 
 export interface OpencodeAdapterOptions {
   /** 取当前槽序列（账号池顺序 + 匿名槽末位）。 */
-  identitySlots: () => Promise<readonly IdentitySlot[]>
+  identitySlots: (model?: string) => Promise<readonly IdentitySlot[]>
   /** 拉远端目录；缺省时直接用兜底表。 */
   fetchRemoteCatalog?: OpencodeCatalogFetcher
   /** 用户模型黑名单。 */
@@ -440,6 +442,7 @@ export class OpencodeAdapter extends LlmAdapter {
       tried.add(slot.id)
       // Token 账本（第 2 期）：回报「本笔请求实际使用的槽」（匿名槽 = 'anonymous'）。
       reportLedgerAccount(OPENCODE.id, slot.id)
+      reportQueueSlot(slot)
 
       let delivered = false
       try {
@@ -455,7 +458,7 @@ export class OpencodeAdapter extends LlmAdapter {
         }
         return
       } catch (error) {
-        if (delivered) throw error
+        if (delivered || error instanceof ModelQueuedError) throw error
         if (error instanceof LlmError && error.code === 'QUOTA_EXCEEDED') throw error
 
         const info = classifyOpencodeFailure(error)
@@ -593,6 +596,7 @@ export class OpencodeAdapter extends LlmAdapter {
       ...slot.proxy === undefined ? {} : { dispatcher: buildProxyDispatcher(slot.proxy) as never },
     }
     const response = await fetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, init)
+    await checkQueuedResponse(response)
     if (!response.ok) {
       // ⚠️ **必须先读体**：Zen 的限流语义（`GoUsageLimitError`）在响应体里，
       // 而 body 只能读一次 —— 读了不传下去，轮换层就只能按状态码猜，
@@ -668,7 +672,7 @@ function sessionIdOf(options: GenerateOptions): string {
 
 /** 在 `ctx.llm` 上注册 opencode 路由。 */
 export function registerOpencodeLlm(ctx: Context, options: OpencodeAdapterOptions): OpencodeAdapter {
-  const adapter = new OpencodeAdapter(options)
+  const adapter = withQueueAccountRotation(OPENCODE.id, options, scoped => new OpencodeAdapter(scoped))
   registerAdapterIdempotent(ctx.llm, [OPENCODE.id], adapter)
   return adapter
 }

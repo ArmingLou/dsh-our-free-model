@@ -1,3 +1,5 @@
+import { withQueueAccountRotation } from './queue-rotation.js'
+import { checkQueuedResponse } from './model-queue.js'
 /**
  * Gemini（Cloud Code Assist）模型适配器。
  *
@@ -626,6 +628,7 @@ export class GeminiAdapter extends LlmAdapter {
           )
         }
 
+        await checkQueuedResponse(response)
         if (response.ok) {
           if (response.body === null) {
             throw new LlmError('gemini: 响应缺少 body', 'EMPTY_RESPONSE')
@@ -785,7 +788,7 @@ export function registerGeminiLlm(
   options: GeminiAdapterOptions,
 ): GeminiAdapter {
   const product = options.product ?? GEMINI
-  const adapter = new GeminiAdapter(options)
+  const adapter = withQueueAccountRotation(product.id, options, scoped => new GeminiAdapter(scoped))
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

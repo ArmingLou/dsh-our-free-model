@@ -268,6 +268,12 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
     'llm-minimax', 'llm-zcode', 'llm-gemini',
   )
   const pool = new AccountPool(ctx)
+  const accountForRefresh = async (provider: string, accountId?: string) => {
+    if (accountId === undefined) return pool.getAvailableAccount(provider, '')
+    const entry = pool.listAccountsByProvider(provider).find(account => account.id === accountId)
+    if (entry === undefined) throw new LlmError(`${provider}: 当前请求的账号已移除`, 'MISSING_CREDENTIAL')
+    return { entry }
+  }
 
   // 「已失效模型」剔除：注入 ctx 只为把日志接进 DSH logger 并复用同一份 home
   // 解析。必须在任何 `registerXxxLlm` 之前调用 —— 各适配器经
@@ -356,7 +362,7 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
         return undefined
       }
     },
-    refresh: async () => {
+    refresh: async (accountId?: string) => {
       // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
       //
       // 为什么：resolveCredential（上面）优先从账号池取
@@ -369,7 +375,7 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
       //
       // 与 Go 一致：`handler.go:197-209` 也是先 Pick 出账号、再对该账号
       // `RefreshToken(acct)`（而非某个全局单例）。
-      const available = await pool.getAvailableAccount(LOBSTERAI.id, '')
+      const available = await accountForRefresh(LOBSTERAI.id, accountId)
       if (available) await lobsterai.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await lobsterai.refresh()
     },
@@ -572,8 +578,8 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
         return undefined
       }
     },
-    refresh: async () => {
-      const available = await pool.getAvailableAccount(TRAE.id, '')
+    refresh: async (accountId?: string) => {
+      const available = await accountForRefresh(TRAE.id, accountId)
       if (available) await trae.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await trae.refresh()
     },
@@ -633,7 +639,7 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
         return undefined
       }
     },
-    refresh: async () => {
+    refresh: async (accountId?: string) => {
       // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
       //
       // 为什么：resolveCredential（上面）优先从账号池取
@@ -643,7 +649,7 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
       // 那份未更新的过期凭据 → 带着过期 token 发请求 → 401。
       // 用户看到的是「刚在 Channel Pack 登录好，却一直认证失败」，
       // 而日志里续期全是成功的，极难排查。
-      const available = await pool.getAvailableAccount(CLINE.id, '')
+      const available = await accountForRefresh(CLINE.id, accountId)
       if (available) await cline.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await cline.refresh()
     },
@@ -931,13 +937,13 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
         return undefined
       }
     },
-    refresh: async () => {
+    refresh: async (accountId?: string) => {
       // ⚠️ MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
       // 这里是真续期（与 Loomy 的「只能探测有效性」不同）。
       //
       // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
       // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
-      const available = await pool.getAvailableAccount(MINIMAX.id, '')
+      const available = await accountForRefresh(MINIMAX.id, accountId)
       if (available) {
         // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
         // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息
@@ -1024,10 +1030,10 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
         return undefined
       }
     },
-    refresh: async () => {
+    refresh: async (accountId?: string) => {
       // ⚠️ 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
       // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
-      const available = await pool.getAvailableAccount(GEMINI.id, '')
+      const available = await accountForRefresh(GEMINI.id, accountId)
       if (available) {
         // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
         // 账号池，否则 UI 一直显示「已过期」而实际能正常发消息。
@@ -1505,8 +1511,10 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   if (config.disableOpencode !== true) {
     const opencodeUA = lazyOpencodeUserAgent()
     opencodeAdapter = registerOpencodeLlm(ctx, {
-      identitySlots: async () => listIdentitySlots(
-        await Promise.all(pool.listAccountsByProvider(OPENCODE.id).map(async (entry) => {
+      identitySlots: async (model?: string) => listIdentitySlots(
+        await Promise.all(pool.listAccountsByProvider(OPENCODE.id).filter(entry =>
+          model === undefined || !((entry.modelRateLimits?.[model] ?? 0) > Date.now()),
+        ).map(async (entry) => {
           const resolved = await ctx.credentials
             .resolve(credentialRef(entry.credentialRef))
             .catch(() => undefined)

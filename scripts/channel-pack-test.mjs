@@ -315,6 +315,8 @@ try {
 }
 
 async function verifySourceRegressions({ ctx, adapters, call, creds }) {
+  const { verifyChannelQueueRotation } = await import('./channel-queue-rotation-test.mjs')
+  await verifyChannelQueueRotation()
   const { verifyChannelPrFixes } = await import('./channel-pr-fixes-test.mjs')
   await verifyChannelPrFixes()
   await verifyLoopResumeEvents()

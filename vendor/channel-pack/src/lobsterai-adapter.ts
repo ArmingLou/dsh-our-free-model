@@ -1,3 +1,6 @@
+import { throwIfModelQueued } from './model-queue.js'
+import { withQueueAccountRotation } from './queue-rotation.js'
+import { checkQueuedResponse } from './model-queue.js'
 /**
  * LobsterAI（有道龙虾）LLM 适配器。
  *
@@ -1151,7 +1154,7 @@ export class LobsteraiAdapter extends LlmAdapter {
         headers,
         body,
         signal: options.signal,
-      })
+      }).then(checkQueuedResponse)
     } catch (error) {
       if (options.signal?.aborted) throw error
       if (isTransportError(error)) {
@@ -1295,6 +1298,7 @@ export class LobsteraiAdapter extends LlmAdapter {
           } catch {
             continue
           }
+          throwIfModelQueued(data)
           if (data.error !== undefined) {
             // ⚠️ 必须抛**可分类的** `LobsteraiStreamError`：额度耗尽正是以
             // 这个形态下发的（HTTP 200 + `{error:{message:'免费额度已用完，请升级套餐'}}`），
@@ -1663,7 +1667,7 @@ function displayNameFor(model: LobsteraiRemoteModel): string {
  */
 export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): LobsteraiAdapter {
   const product = options.product ?? LOBSTERAI
-  const adapter = new LobsteraiAdapter(options)
+  const adapter = withQueueAccountRotation(product.id, options, scoped => new LobsteraiAdapter(scoped))
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Channel Pack「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。

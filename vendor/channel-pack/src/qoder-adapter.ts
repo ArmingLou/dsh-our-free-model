@@ -704,12 +704,12 @@ export class QoderAdapter extends LlmAdapter {
     }
 
     // 1. 获取凭据（过期则先静默续期）
-    let credential = await this.options.resolveCredential(options.model)
-    if (credential === undefined || isQoderExpired(credential)) {
+    let initialCredential = await this.options.resolveCredential(options.model)
+    if (initialCredential === undefined || isQoderExpired(initialCredential)) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential(options.model)
+      initialCredential = await this.options.resolveCredential(options.model)
     }
-    if (credential === undefined || credential.access_token.length === 0) {
+    if (initialCredential === undefined || initialCredential.access_token.length === 0) {
       throw new LlmError('qoder: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
 
@@ -718,7 +718,7 @@ export class QoderAdapter extends LlmAdapter {
     // ⚠️ `uid` 是后加字段，旧凭据里没有；缺它时 WASM 会产出**签名无效**的
     // 请求，服务端回 `Signature invalid (101)`（真实缺陷，用户报障）。
     // 这里调用注入的钩子补一次（实现会调 userinfo 并回写凭据）。
-    credential = await this.ensureUid(credential)
+    let credential = await this.ensureUid(initialCredential)
 
     // 3. 走**加密推理**路径（客户端真实链路，认模型目录 key）。
     //

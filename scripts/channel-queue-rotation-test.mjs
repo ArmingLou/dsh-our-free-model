@@ -1,0 +1,228 @@
+import assert from 'node:assert/strict'
+
+export async function verifyChannelQueueRotation() {
+  const { withQueueAccountRotation, reportQueueSlot } = await import('../vendor/channel-pack/src/queue-rotation.ts')
+  const { ModelQueuedError, throwIfModelQueued, checkQueuedResponse } = await import('../vendor/channel-pack/src/model-queue.ts')
+  const { LlmError } = await import('@deepseek-ai/dsh-llm')
+  const collect = async iterable => { const result = []; for await (const chunk of iterable) result.push(chunk); return result }
+  const queued = () => new ModelQueuedError('fixture queue', { queueInfo: { isQueued: true }, retryAfterMs: 0 })
+  const credential = id => ({ access_token: id, refresh_token: `refresh-${id}`, expires_at: '2099-01-01T00:00:00Z' })
+  const makePool = (provider, ids = ['a', 'b']) => {
+    const rows = ids.map(id => ({ entry: { id, provider, enabled: true, credentialRef: `ref-${id}`, modelRateLimits: {} }, credential: credential(id) }))
+    return {
+      rows,
+      listAccountsByProvider: id => rows.filter(row => row.entry.provider === id).map(row => row.entry),
+      findAccountIdByCredential: async (id, token) => rows.find(row => row.entry.provider === id && row.credential.access_token === token)?.entry.id ?? '',
+      findAccountIdByIdentityField: async (id, field, token) => rows.find(row => row.entry.provider === id && row.credential[field] === token)?.entry.id ?? '',
+      resolveCredentialForAccount: async id => rows.find(row => row.entry.id === id)?.credential,
+      disabledModelsFor: () => new Set(),
+      getAvailableAccount: async (id, model, excluded = new Set()) => rows.find(row => row.entry.provider === id && row.entry.enabled
+        && !excluded.has(row.entry.id) && !(row.entry.modelRateLimits[model] > Date.now())) ?? null,
+    }
+  }
+  const clock = () => {
+    let now = 0
+    return { now: () => now, sleep: async ms => { now += ms } }
+  }
+
+  for (const body of [{ error: { code: 'AUTH', message: 'not queued' } }, { isQueued: false }, { error: { code: 'rate_limit' } }, 'server busy', { response: '{"isQueued":true}' }]) {
+    assert.doesNotThrow(() => throwIfModelQueued(body))
+  }
+  for (const body of [{ isQueued: true }, { error: { code: 'model_queued', retryAfterSeconds: 2 } }, { data: { message: '{"type":"queued"}' } }]) {
+    assert.throws(() => throwIfModelQueued(body), error => error instanceof ModelQueuedError)
+  }
+  for (const status of [200, 403, 429, 503]) {
+    const response = Response.json({ error: { code: 'model_queued' } }, { status, headers: { 'retry-after': '2' } })
+    await assert.rejects(checkQueuedResponse(response), error => error instanceof ModelQueuedError && error.retryAfterMs === 2000)
+    assert.equal(response.bodyUsed, false)
+  }
+  const ordinary = Response.json({ error: { code: 'AUTH' } }, { status: 403 })
+  assert.equal(await checkQueuedResponse(ordinary), ordinary)
+  assert.equal(ordinary.bodyUsed, false)
+
+  for (const prepared of [false, true]) {
+    const pool = makePool('fixture')
+    pool.rows.unshift({ entry: { id: 'disabled', provider: 'fixture', enabled: false, modelRateLimits: {} }, credential: credential('disabled') })
+    pool.rows.splice(2, 0, { entry: { id: 'limited', provider: 'fixture', enabled: true, modelRateLimits: { model: Date.now() + 60_000 } }, credential: credential('limited') })
+    pool.rows.push({ entry: { id: 'foreign', provider: 'other', enabled: true, modelRateLimits: {} }, credential: credential('foreign') })
+    const sent = [], refreshed = []
+    const options = {
+      accountPool: pool,
+      resolveCredential: async () => credential('a'),
+      currentAccountId: () => 'a',
+      refresh: async id => { refreshed.push(id) },
+    }
+    class Adapter {
+      #options
+      constructor(value) { this.#options = value }
+      async *stream() {
+        const value = await this.#options.resolveCredential('model')
+        sent.push(value.access_token)
+        if (value.access_token === 'a') throw queued()
+        assert.equal(this.#options.currentAccountId(), 'b')
+        await this.#options.refresh()
+        yield { type: 'text-delta', text: 'ok' }
+      }
+      async prepareCall() { const raw = this.stream.bind(this); return { model: 'model', stream: raw } }
+    }
+    const adapter = withQueueAccountRotation('fixture', options, value => new Adapter(value), clock())
+    const call = prepared ? await adapter.prepareCall() : adapter
+    assert.equal((await collect(call.stream({ model: 'model' })))[0].text, 'ok')
+    assert.deepEqual(sent, ['a', 'a', 'a', 'b'])
+    assert.deepEqual(refreshed, ['b'])
+    assert.equal(options.currentAccountId(), 'a', 'shared default identity is unchanged')
+  }
+
+  {
+    const pool = makePool('fixture', ['a', 'b', 'c']), sent = [], refreshed = []
+    const adapter = withQueueAccountRotation('fixture', {
+      accountPool: pool, resolveCredential: async () => credential('a'), refresh: async id => { refreshed.push(id) },
+    }, options => ({
+      async *stream(input) {
+        let value = await options.resolveCredential(input.model)
+        if (value.access_token === 'a') {
+          sent.push('a:quota')
+          const next = await options.accountPool.getAvailableAccount('fixture', input.model, new Set(['a']))
+          value = next.credential
+        }
+        sent.push(value.access_token)
+        if (value.access_token === 'b') throw queued()
+        await options.refresh()
+        yield { text: 'ok' }
+      },
+    }), clock())
+    assert.equal((await collect(adapter.stream({ model: 'model' })))[0].text, 'ok')
+    assert.deepEqual(sent, ['a:quota', 'b', 'b', 'b', 'c'])
+    assert.deepEqual(refreshed, ['c'])
+  }
+  {
+    const pool = makePool('fixture'), sent = []
+    const adapter = withQueueAccountRotation('fixture', {
+      accountPool: pool, resolveCredential: async () => credential('a'),
+    }, options => ({
+      async *stream(input) {
+        const value = await options.resolveCredential(input.model)
+        await Promise.resolve()
+        sent.push([input.model, value.access_token])
+        if (input.model === 'queued' && value.access_token === 'a') throw queued()
+        yield { text: value.access_token }
+      },
+    }), clock())
+    const [rotated, ordinary] = await Promise.all([collect(adapter.stream({ model: 'queued' })), collect(adapter.stream({ model: 'ordinary' }))])
+    assert.equal(rotated[0].text, 'b'); assert.equal(ordinary[0].text, 'a')
+    assert.deepEqual(sent.filter(row => row[0] === 'ordinary'), [['ordinary', 'a']])
+  }
+  {
+    const pool = makePool('fixture'), sent = []
+    const adapter = withQueueAccountRotation('fixture', { accountPool: pool, resolveCredential: async () => credential('a') }, options => ({
+      async *stream() { sent.push((await options.resolveCredential('model')).access_token); yield { text: 'partial' }; throw queued() },
+    }), clock())
+    await assert.rejects(collect(adapter.stream({ model: 'model' })), error => error instanceof ModelQueuedError)
+    assert.deepEqual(sent, ['a'])
+  }
+  {
+    const pool = makePool('fixture', ['a']), sent = []
+    let waits = 0
+    const adapter = withQueueAccountRotation('fixture', { accountPool: pool, resolveCredential: async () => credential('a') }, options => ({
+      async *stream() { const value = await options.resolveCredential('model'); sent.push(value.access_token); if (value.access_token === 'a') throw queued(); yield { text: 'late' } },
+    }), { now: () => waits * 10_000, sleep: async () => {
+      if (++waits === 3) pool.rows.push({ entry: { id: 'b', provider: 'fixture', enabled: true, modelRateLimits: {} }, credential: credential('b') })
+    } })
+    assert.equal((await collect(adapter.stream({ model: 'model' })))[0].text, 'late')
+    assert.equal(sent.at(-1), 'b')
+    assert.ok(sent.length < 10)
+  }
+  {
+    const controller = new AbortController(), sent = []
+    const adapter = withQueueAccountRotation('fixture', {}, () => ({ async *stream() { sent.push(1); throw queued() } }))
+    const result = collect(adapter.stream({ model: 'model', signal: controller.signal }))
+    setTimeout(() => controller.abort(new Error('fixture stopped')), 0)
+    await assert.rejects(result, /fixture stopped/)
+    assert.equal(sent.length, 1)
+  }
+  {
+    let now = 0, calls = 0
+    const adapter = withQueueAccountRotation('fixture', {}, () => ({ async *stream() { calls++; throw queued() } }), {
+      now: () => now, sleep: async () => { now += 30 * 60_000 },
+    })
+    await assert.rejects(collect(adapter.stream({ model: 'model' })), /排队等待超时/)
+    assert.equal(calls, 1)
+    const quota = new LlmError('quota fixture', 'QUOTA_EXCEEDED')
+    const ordinary = withQueueAccountRotation('fixture', {}, () => ({ async *stream() { throw quota } }), clock())
+    await assert.rejects(collect(ordinary.stream({ model: 'model' })), error => error === quota)
+  }
+  {
+    const sent = []
+    const slots = ['a', 'b'].map(id => ({ id, kind: 'account', apiKey: id }))
+    const adapter = withQueueAccountRotation('opencode', { identitySlots: async model => { assert.equal(model, 'model'); return slots } }, options => ({
+      async *stream() {
+        const slot = (await options.identitySlots())[0]
+        reportQueueSlot(slot); sent.push(slot.id)
+        if (slot.id === 'a') throw queued()
+        yield { text: 'ok' }
+      },
+    }), clock())
+    assert.equal((await collect(adapter.stream({ model: 'model' })))[0].text, 'ok')
+    assert.deepEqual(sent, ['a', 'a', 'a', 'b'])
+  }
+  const sse = frames => new Response(frames.map(([event, data]) => `${event ? `event: ${event}\n` : ''}data: ${JSON.stringify(data)}\n\n`).join(''), {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+  const success = provider => {
+    if (provider === 'trae') return sse([['output', { response: 'ok' }], ['done', { finish_reason: 'stop' }]])
+    if (provider === 'gemini') return sse([['', { response: { candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] } }]])
+    if (['minimax', 'zcode'].includes(provider)) return sse([
+      ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+      ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } }],
+      ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+      ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } }],
+      ['message_stop', { type: 'message_stop' }],
+    ])
+    return sse([['', { choices: [{ delta: { content: 'ok' }, finish_reason: null }] }], ['', { choices: [{ delta: {}, finish_reason: 'stop' }] }]])
+  }
+  for (const provider of ['lobsterai', 'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'gemini', 'zcode', 'opencode']) {
+    const module = await import(`../vendor/channel-pack/src/${provider}-adapter.ts`)
+    const register = Object.entries(module).find(([name]) => /^register.*Llm$/.test(name))[1]
+    for (const transport of ['http', 'sse']) {
+      const pool = makePool(provider), sent = []
+      for (const row of pool.rows) {
+        const token = `fixture-${row.entry.id}`
+        row.credential = { ...credential(token), uid: row.entry.id, userid: row.entry.id, user_id: row.entry.id, phone: '13800000000', device_mid: 'fixture-device', machine_id: 'fixture-machine', device_id: 'fixture-device' }
+        if (provider === 'zcode') { row.credential.zcode_jwt = token; delete row.credential.access_token }
+      }
+      const upstream = async (_url, init) => {
+        if (init?.method !== 'POST') return Response.json({ data: [] })
+        const headers = [...new Headers(init?.headers).values()].join(' ')
+        const id = headers.includes('fixture-a') ? 'a' : headers.includes('fixture-b') ? 'b' : undefined
+        assert.ok(id, `${provider}: actual request carries account credential`)
+        sent.push(id)
+        if (id === 'b') return success(provider)
+        const error = { error: { code: 'model_queued', retryAfterSeconds: 0 } }
+        return transport === 'http' ? Response.json(error, { status: 503 }) : sse([['error', error]])
+      }
+      let mounted
+      const adapter = register({ llm: { registerAdapter(_ids, value) { mounted = value } } }, {
+        credentialRef: 'fixture-ref', accountPool: provider === 'opencode' ? undefined : pool,
+        resolveCredential: async () => pool.rows[0].credential,
+        refresh: async id => pool.resolveCredentialForAccount(id ?? 'a'),
+        currentAccountId: () => 'a', fetchImpl: upstream, project: 'fixture-project',
+        resolveClientVersion: async () => 'fixture-version',
+        mintCaptcha: async () => 'fixture-captcha', gate: { run: async (_model, send) => send() },
+        loadModelsDev: async () => new Map(),
+        identitySlots: async () => pool.rows.map(row => ({ id: row.entry.id, kind: 'account', apiKey: `fixture-${row.entry.id}`, userAgent: 'fixture', fingerprint: { projectId: 'fixture-project', generation: 0 } })),
+      })
+      assert.ok(mounted, `${provider}: registered with host wrappers`)
+      const model = adapter.listAllModels()[0].id
+      const fetchBefore = globalThis.fetch
+      globalThis.fetch = upstream
+      try {
+        const call = await mounted.prepareCall(provider, model)
+        const chunks = await collect(call.stream({ model, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] }))
+        assert.deepEqual(sent, ['a', 'a', 'a', 'b'], `${provider} ${transport}: rotates before output`)
+        assert.ok(chunks.some(chunk => chunk.text === 'ok' || chunk.delta === 'ok'), `${provider} ${transport}: returns answer`)
+      } finally { globalThis.fetch = fetchBefore }
+    }
+    console.log(`ok  channel queue registered ${provider}: HTTP + SSE`)
+  }
+  console.log('ok  channel queue: 9 registered adapters HTTP/SSE, direct/prepared calls, account/model scope, refresh, concurrency, late account, partial output, abort, timeout and identity slots')
+}

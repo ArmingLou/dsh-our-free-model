@@ -1,3 +1,5 @@
+import { withQueueAccountRotation } from './queue-rotation.js'
+import { checkQueuedResponse } from './model-queue.js'
 /**
  * Raccoon Work LLM 适配器。
  *
@@ -460,7 +462,7 @@ export class RaccoonAdapter extends LlmAdapter {
             body: buildBody(),
             signal: options.signal,
           },
-        )
+        ).then(checkQueuedResponse)
       } catch (error) {
         if (options.signal?.aborted) throw error
         if (isTransportError(error)) {
@@ -551,7 +553,7 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerRaccoonLlm(ctx: Context, options: RaccoonAdapterOptions): RaccoonAdapter {
   const product = options.product ?? RACCOON
-  const adapter = new RaccoonAdapter(options)
+  const adapter = withQueueAccountRotation(product.id, options, scoped => new RaccoonAdapter(scoped))
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

@@ -1,3 +1,5 @@
+import { withQueueAccountRotation } from './queue-rotation.js'
+import { checkQueuedResponse } from './model-queue.js'
 /**
  * Cline LLM 适配器。
  *
@@ -877,7 +879,7 @@ export class ClineAdapter extends LlmAdapter {
         },
         body,
         signal: options.signal,
-      })
+      }).then(checkQueuedResponse)
     } catch (error) {
       if (options.signal?.aborted === true) throw error
       if (isTransportError(error)) {
@@ -967,7 +969,7 @@ const CLINE_REGION_FORBIDDEN_MARKERS: readonly string[] = [
  */
 export function registerClineLlm(ctx: Context, options: ClineAdapterOptions): ClineAdapter {
   const product = options.product ?? CLINE
-  const adapter = new ClineAdapter(options)
+  const adapter = withQueueAccountRotation(product.id, options, scoped => new ClineAdapter(scoped))
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Channel Pack「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
