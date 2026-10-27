@@ -10,6 +10,7 @@ interface QueueOptions {
   resolveCredential?: (model?: string) => Promise<unknown>
   refresh?: (accountId?: string) => Promise<unknown>
   currentAccountId?: () => string | undefined
+  nextAccount?: (model: string, tried: ReadonlySet<string>) => Promise<{ accountId: string; credential: unknown } | undefined>
   identitySlots?: (model?: string) => Promise<readonly IdentitySlot[]>
 }
 
@@ -80,6 +81,18 @@ export function withQueueAccountRotation<O extends QueueOptions, A extends objec
         return typeof value === 'function' ? value.bind(target) : value
       },
     })
+    if (options.nextAccount !== undefined) {
+      scoped.nextAccount = async (model, tried) => {
+        const request = active()
+        const relevant = request !== undefined && model === request.model
+        const next = await options.nextAccount!(model, relevant ? new Set([...tried, ...request.tried]) : tried)
+        if (next !== undefined && relevant) {
+          const entry = pool.listAccountsByProvider(provider).find(account => account.id === next.accountId)
+          if (entry !== undefined) remember(request, { entry, credential: next.credential as Account['credential'] })
+        }
+        return next
+      }
+    }
     if (options.resolveCredential !== undefined) {
       scoped.resolveCredential = async model => {
         const request = active()
@@ -145,7 +158,11 @@ export function withQueueAccountRotation<O extends QueueOptions, A extends objec
         if (queued >= 3 || now() - since >= 20_000) {
           queued = 0
           since = now()
-          if (pool !== undefined) {
+          if (scoped.nextAccount !== undefined) {
+            // Loomy 的永久积分锁定等策略属于渠道选号入口，不能退回通用池绕过它。
+            const next = await requests.run(request, () => scoped.nextAccount!(model, request.tried))
+            if (next !== undefined) continue
+          } else if (pool !== undefined) {
             const next = await pool.getAvailableAccount(provider, model, request.tried)
             if (next !== null) {
               remember(request, next)

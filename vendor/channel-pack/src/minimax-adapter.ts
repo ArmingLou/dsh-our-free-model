@@ -415,9 +415,7 @@ export class MinimaxAdapter extends LlmAdapter {
       headers: minimaxInferHeaders(credential),
       body: JSON.stringify(payload),
       signal: options.signal,
-    })
-
-    await checkQueuedResponse(response)
+    }).then(checkQueuedResponse)
     if (!response.ok) {
       const text = await response.text().catch(() => '')
       // ⚠️ 402 是**余额不足**，必须原样透出 —— 它是最常见的真实失败，

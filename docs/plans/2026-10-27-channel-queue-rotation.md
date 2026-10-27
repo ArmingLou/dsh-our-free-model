@@ -17,3 +17,7 @@
 验证结果：`TMPDIR=/private/tmp npm run test:contributor` 99/99 通过；`npm run typecheck`、`npm run typecheck:standalone`、三个生成产物的一致性检查及 `git diff --check` 通过。未调用真实渠道或消耗额度。
 
 额外运行 vendored TypeScript 全量检查，现有宿主消息契约及依赖类型仍有错误；与基线对照未新增错误，并修正了 #663 的可选凭据闭包类型问题。`npm run test:release` 尚未通过：本分支的新产物需要通过受信发布工作流重新生成签名清单与来源 revision，当前没有发布或安装到本机。
+
+审查修正：排队换号复用渠道的 `nextAccount`，保留 Loomy 永久积分锁定，并追踪 Raccoon/Loomy 额度换号的真实账号；Qoder 排队换号同步额度处理状态。成功的 JSON 响应改为随流检查有限长度前缀，避免错标 JSON 的 SSE 等待整流结束，同时保留原解析器的超时及取消。
+
+修正后的回归覆盖积分锁定/解锁、额度后排队、Qoder 国际/国内版 HTTP/SSE 排队后额度不足、首块即时交付及首块超时，并将九渠道注册夹具扩展至分块 JSON 200 与错标 JSON 的 SSE。再次运行全仓离线测试，99/99 通过；根目录/前端类型检查、生成产物一致性和 `git diff --check` 通过，vendored 类型诊断未新增。

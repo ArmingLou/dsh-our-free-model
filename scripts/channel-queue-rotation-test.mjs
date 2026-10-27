@@ -33,12 +33,42 @@ export async function verifyChannelQueueRotation() {
   }
   for (const status of [200, 403, 429, 503]) {
     const response = Response.json({ error: { code: 'model_queued' } }, { status, headers: { 'retry-after': '2' } })
-    await assert.rejects(checkQueuedResponse(response), error => error instanceof ModelQueuedError && error.retryAfterMs === 2000)
-    assert.equal(response.bodyUsed, false)
+    await assert.rejects(checkQueuedResponse(response).then(value => value.text()), error => error instanceof ModelQueuedError && error.retryAfterMs === 2000)
+    if (status !== 200) assert.equal(response.bodyUsed, false)
   }
   const ordinary = Response.json({ error: { code: 'AUTH' } }, { status: 403 })
   assert.equal(await checkQueuedResponse(ordinary), ordinary)
   assert.equal(ordinary.bodyUsed, false)
+
+  // 错标为 JSON 的 SSE 必须在连接关闭前交付首块，不能预读整个响应。
+  {
+    let source
+    const first = new TextEncoder().encode('data: {"choices":[{"delta":{"content":"first"}}]}\n\n')
+    const response = new Response(new ReadableStream({ start(controller) { source = controller; controller.enqueue(first) } }), {
+      headers: { 'content-type': 'application/json' },
+    })
+    let timer
+    try {
+      const received = await Promise.race([
+        checkQueuedResponse(response).then(value => value.body.getReader().read()),
+        new Promise(resolve => { timer = setTimeout(() => resolve('blocked'), 200) }),
+      ])
+      assert.notEqual(received, 'blocked', '首块不能等待上游 close')
+      assert.deepEqual(received.value, first)
+    } finally { clearTimeout(timer); source.close() }
+  }
+  {
+    const { consumeOpenAiSse } = await import('../vendor/channel-pack/src/openai-compat.ts')
+    let canceled = false
+    const response = new Response(new ReadableStream({ cancel() { canceled = true } }), {
+      headers: { 'content-type': 'application/json' },
+    })
+    const checked = await checkQueuedResponse(response)
+    await assert.rejects(collect(consumeOpenAiSse(checked, {}, {
+      label: 'fixture', firstTokenTimeoutMs: 20, chunkTimeoutMs: 20,
+    })), error => error.code === 'TIMEOUT')
+    assert.equal(canceled, true, '无数据流仍由原解析器超时并取消上游')
+  }
 
   for (const prepared of [false, true]) {
     const pool = makePool('fixture')
@@ -183,7 +213,7 @@ export async function verifyChannelQueueRotation() {
   for (const provider of ['lobsterai', 'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'gemini', 'zcode', 'opencode']) {
     const module = await import(`../vendor/channel-pack/src/${provider}-adapter.ts`)
     const register = Object.entries(module).find(([name]) => /^register.*Llm$/.test(name))[1]
-    for (const transport of ['http', 'sse']) {
+    for (const transport of ['http', 'sse', 'json', 'json-sse']) {
       const pool = makePool(provider), sent = []
       for (const row of pool.rows) {
         const token = `fixture-${row.entry.id}`
@@ -196,9 +226,24 @@ export async function verifyChannelQueueRotation() {
         const id = headers.includes('fixture-a') ? 'a' : headers.includes('fixture-b') ? 'b' : undefined
         assert.ok(id, `${provider}: actual request carries account credential`)
         sent.push(id)
-        if (id === 'b') return success(provider)
+        if (id === 'b') {
+          const response = success(provider)
+          if (transport === 'json-sse') response.headers.set('content-type', 'application/json')
+          return response
+        }
         const error = { error: { code: 'model_queued', retryAfterSeconds: 0 } }
-        return transport === 'http' ? Response.json(error, { status: 503 }) : sse([['error', error]])
+        if (transport === 'http') return Response.json(error, { status: 503 })
+        if (transport === 'json') {
+          const text = JSON.stringify(error), encoder = new TextEncoder()
+          return new Response(new ReadableStream({ start(controller) {
+            controller.enqueue(encoder.encode(text.slice(0, 8)))
+            controller.enqueue(encoder.encode(text.slice(8)))
+            controller.close()
+          } }), { headers: { 'content-type': 'application/json' } })
+        }
+        const response = sse([['error', error]])
+        if (transport === 'json-sse') response.headers.set('content-type', 'application/json')
+        return response
       }
       let mounted
       const adapter = register({ llm: { registerAdapter(_ids, value) { mounted = value } } }, {
@@ -222,7 +267,48 @@ export async function verifyChannelQueueRotation() {
         assert.ok(chunks.some(chunk => chunk.text === 'ok' || chunk.delta === 'ok'), `${provider} ${transport}: returns answer`)
       } finally { globalThis.fetch = fetchBefore }
     }
-    console.log(`ok  channel queue registered ${provider}: HTTP + SSE`)
+    console.log(`ok  channel queue registered ${provider}: HTTP + SSE + fragmented JSON 200 + mislabeled SSE`)
+  }
+  const { loomyBalanceTier, loomyTierUsable } = await import('../vendor/channel-pack/src/loomy-balance-rank.ts')
+  for (const scenario of [
+    { provider: 'loomy', locked: true }, { provider: 'loomy', locked: false },
+    { provider: 'loomy', quotaFirst: true }, { provider: 'raccoon', quotaFirst: true },
+  ]) {
+    const { provider, locked = false, quotaFirst = false } = scenario
+    const module = await import(`../vendor/channel-pack/src/${provider}-adapter.ts`)
+    const register = Object.entries(module).find(([name]) => /^register.*Llm$/.test(name))[1]
+    const pool = makePool(provider, quotaFirst ? ['a', 'b', 'c'] : ['a', 'b'])
+    const sent = [], marked = []
+    let nextCalls = 0, bQueues = 0
+    pool.updateModelRateLimit = async (id, model, resetAt) => {
+      marked.push(id); pool.rows.find(row => row.entry.id === id).entry.modelRateLimits[model] = resetAt
+    }
+    let mounted
+    const adapter = register({ llm: { registerAdapter(_ids, value) { mounted = value } } }, {
+      credentialRef: 'fixture-ref', accountPool: pool, resolveCredential: async () => pool.rows[0].credential,
+      refresh: async id => pool.resolveCredentialForAccount(id ?? 'a'),
+      nextAccount: async (model, tried) => {
+        nextCalls++
+        const next = await pool.getAvailableAccount(provider, model, tried)
+        if (!next) return undefined
+        if (!quotaFirst && !loomyTierUsable(loomyBalanceTier({ dailyBalance: 0, permanentBalance: 100 }, { allowPermanent: !locked }))) return undefined
+        return { accountId: next.entry.id, credential: next.credential }
+      },
+      fetchImpl: async (_url, init) => {
+        const id = new Headers(init.headers).get('authorization').slice(7)
+        sent.push(id)
+        if (quotaFirst && id === 'a') return Response.json({ code: 402, message: '积分不足' }, { status: 402 })
+        const isQueued = quotaFirst ? id === 'b' && ++bQueues <= 3 : id === 'a' && sent.length <= 3
+        return isQueued ? Response.json({ error: { code: 'model_queued', retryAfterSeconds: 0 } }, { status: 503 }) : success(provider)
+      },
+    })
+    const model = adapter.listAllModels()[0].id
+    const call = await mounted.prepareCall(provider, model)
+    await collect(call.stream({ model, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] }))
+    assert.deepEqual(sent, quotaFirst ? ['a', 'b', 'b', 'b', 'c'] : locked ? ['a', 'a', 'a', 'a'] : ['a', 'a', 'a', 'b'], `${provider}: 保留积分锁定及真实换号状态`)
+    assert.deepEqual(marked, quotaFirst ? ['a'] : [])
+    assert.ok(nextCalls > 0, '排队换号必须沿用渠道选号策略')
+    console.log(`ok  channel queue ${provider}: ${quotaFirst ? 'quota → queue keeps actual account' : locked ? 'permanent credits locked' : 'permanent credits allowed'}`)
   }
   console.log('ok  channel queue: 9 registered adapters HTTP/SSE, direct/prepared calls, account/model scope, refresh, concurrency, late account, partial output, abort, timeout and identity slots')
 }

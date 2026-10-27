@@ -271,9 +271,32 @@ export function throwIfModelQueued(body: unknown, headers?: { get(name: string):
 
 /** 保留原响应体供渠道原有鉴权、额度错误处理消费。 */
 export async function checkQueuedResponse(response: Response): Promise<Response> {
-  if (!response.ok || response.headers.get('content-type')?.includes('application/json')) {
+  if (!response.ok) {
     const body = await response.clone().text().catch(() => undefined)
     if (body !== undefined) throwIfModelQueued(body, response.headers)
+  } else if (response.body !== null && response.headers.get('content-type')?.includes('application/json')) {
+    const decoder = new TextDecoder()
+    let prefix: string | undefined = ''
+    const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (prefix !== undefined) {
+          prefix += decoder.decode(chunk, { stream: true })
+          // shortcut: 只检查开头 64 KiB；上游出现更大的排队错误 JSON 时扩展识别。
+          if (prefix.length > 65_536 || (prefix.trimStart().length > 0 && !prefix.trimStart().startsWith('{'))) {
+            prefix = undefined
+          } else {
+            let parsed: unknown
+            try { parsed = JSON.parse(prefix) } catch { /* JSON 可能跨块，继续读取。 */ }
+            if (parsed !== undefined) {
+              prefix = undefined
+              throwIfModelQueued(parsed, response.headers)
+            }
+          }
+        }
+        controller.enqueue(chunk)
+      },
+    }))
+    return new Response(body, response)
   }
   return response
 }

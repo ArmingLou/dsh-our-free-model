@@ -628,7 +628,7 @@ export class GeminiAdapter extends LlmAdapter {
           )
         }
 
-        await checkQueuedResponse(response)
+        response = await checkQueuedResponse(response)
         if (response.ok) {
           if (response.body === null) {
             throw new LlmError('gemini: 响应缺少 body', 'EMPTY_RESPONSE')
