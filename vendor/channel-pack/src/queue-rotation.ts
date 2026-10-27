@@ -97,6 +97,20 @@ export function withQueueAccountRotation<O extends QueueOptions, A extends objec
       scoped.resolveCredential = async model => {
         const request = active()
         if (request?.account !== undefined) {
+          if (options.nextAccount !== undefined) {
+            // 复用原选号策略验证当前账号；不能用 scoped.nextAccount，它会排除当前已试账号。
+            const others = new Set(pool.listAccountsByProvider(provider).filter(account => account.id !== request.account!.entry.id).map(account => account.id))
+            const next = await options.nextAccount(request.model, others)
+              ?? await options.nextAccount(request.model, request.tried)
+            if (next === undefined) {
+              throw new LlmError(`${provider}: 当前账号不可用或无法确认余额，且没有符合渠道策略的备用账号`, 'QUEUE')
+            }
+            const entry = pool.listAccountsByProvider(provider).find(account => account.id === next.accountId && account.enabled
+              && !((account.modelRateLimits?.[request.model] ?? 0) > Date.now()))
+            if (entry === undefined) throw new LlmError(`${provider}: 当前请求的账号已移除、停用或受限`, 'QUEUE')
+            remember(request, { entry, credential: next.credential as Account['credential'] })
+            return next.credential
+          }
           return pool.resolveCredentialForAccount(request.account.entry.id)
         }
         const credential = await options.resolveCredential!(model)

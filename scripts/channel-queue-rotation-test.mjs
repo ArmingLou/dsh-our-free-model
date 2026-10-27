@@ -291,7 +291,7 @@ export async function verifyChannelQueueRotation() {
         nextCalls++
         const next = await pool.getAvailableAccount(provider, model, tried)
         if (!next) return undefined
-        if (!quotaFirst && !loomyTierUsable(loomyBalanceTier({ dailyBalance: 0, permanentBalance: 100 }, { allowPermanent: !locked }))) return undefined
+        if (!quotaFirst && !loomyTierUsable(loomyBalanceTier({ dailyBalance: next.entry.id === 'a' ? 1 : 0, permanentBalance: 100 }, { allowPermanent: !locked }))) return undefined
         return { accountId: next.entry.id, credential: next.credential }
       },
       fetchImpl: async (_url, init) => {
@@ -309,6 +309,54 @@ export async function verifyChannelQueueRotation() {
     assert.deepEqual(marked, quotaFirst ? ['a'] : [])
     assert.ok(nextCalls > 0, '排队换号必须沿用渠道选号策略')
     console.log(`ok  channel queue ${provider}: ${quotaFirst ? 'quota → queue keeps actual account' : locked ? 'permanent credits locked' : 'permanent credits allowed'}`)
+  }
+  const { LoomyAdapter } = await import('../vendor/channel-pack/src/loomy-adapter.ts')
+  const { LOOMY } = await import('../vendor/channel-pack/src/loomy-product.ts')
+  const { LoomyBalanceSelector } = await import('../vendor/channel-pack/src/loomy-balance-selector.ts')
+  for (const scenario of [{ locked: true }, { locked: false }, { locked: true, addBackup: true }, { locked: true, unknown: true }]) {
+    const { locked, addBackup = false, unknown = false } = scenario
+    const pool = makePool('loomy', ['a']), sent = [], checked = []
+    let now = 0
+    const selector = new LoomyBalanceSelector({
+      product: LOOMY, now: () => now,
+      resolveCredential: async ref => pool.rows.find(row => row.entry.credentialRef === ref)?.credential,
+      fetcher: async (_url, init) => {
+        const id = new Headers(init.headers).get('token')
+        checked.push([id, now])
+        if (unknown && now >= 60_000) return new Response('fixture unavailable', { status: 503 })
+        return Response.json({ code: '000000', data: { balance: 100, dailyBalance: id === 'a' && now >= 60_000 ? 0 : 1 } })
+      },
+    })
+    const select = async (model, excluded = new Set()) => {
+      const candidates = pool.listAccountsByProvider('loomy').filter(row => row.enabled && !excluded.has(row.id) && !(row.modelRateLimits[model] > Date.now()))
+      const picked = await selector.select(candidates, { allowPermanent: !locked })
+      if (!picked.ok) return undefined
+      return { accountId: picked.account.id, credential: await pool.resolveCredentialForAccount(picked.account.id) }
+    }
+    const adapter = withQueueAccountRotation('loomy', {
+      credentialRef: 'fixture', accountPool: pool,
+      resolveCredential: async model => (await select(model))?.credential,
+      refresh: async () => { throw new Error('余额策略失败不能触发认证续期') }, nextAccount: select,
+      fetchImpl: async (_url, init) => {
+        const id = new Headers(init.headers).get('authorization').slice(7)
+        sent.push(id)
+        return sent.length <= 6 ? Response.json({ error: { code: 'model_queued', retryAfterSeconds: 10 } }, { status: 503 }) : success('loomy')
+      },
+    }, options => new LoomyAdapter(options), { now: () => now, sleep: async ms => {
+      now += ms
+      if (addBackup && now >= 60_000 && pool.rows.length === 1) pool.rows.push({ entry: { id: 'b', provider: 'loomy', enabled: true, credentialRef: 'ref-b', modelRateLimits: {} }, credential: credential('b') })
+    } })
+    const model = adapter.listAllModels()[0].id
+    const stream = collect(adapter.stream({ model, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] }))
+    if (locked && !addBackup) {
+      await assert.rejects(stream, error => error.code === 'QUEUE')
+      assert.deepEqual(sent, Array(6).fill('a'), '每日额度耗尽后不能发出第七次请求')
+    } else {
+      await stream
+      assert.deepEqual(sent, [...Array(6).fill('a'), addBackup ? 'b' : 'a'])
+    }
+    assert.ok(checked.some(([id, time]) => id === 'a' && time >= 60_000), '沿用真实余额缓存，并在过期后重查')
+    console.log(`ok  Loomy queue after balance TTL: locked=${locked}, backup=${addBackup}, unknown=${unknown}`)
   }
   console.log('ok  channel queue: 9 registered adapters HTTP/SSE, direct/prepared calls, account/model scope, refresh, concurrency, late account, partial output, abort, timeout and identity slots')
 }
