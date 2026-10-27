@@ -443,7 +443,7 @@ export interface QoderAdapterOptions {
   /** 从凭据存储解析凭据。 */
   resolveCredential: (modelId?: string) => Promise<QoderCredential | undefined>
   /** 静默续期凭据。 */
-  refresh: () => Promise<void>
+  refresh: (accountId?: string) => Promise<void>
   /** 多账号池（用于限流时切换账号与模型黑名单）。 */
   accountPool?: AccountPool
   /**
@@ -888,6 +888,7 @@ export class QoderAdapter extends LlmAdapter {
           queueActiveAccountId = switched.accountId
           activeAccountId = switched.accountId
           triedAccounts.add(switched.accountId)
+          authRefreshed = false
           accountQueueAttempts = 0
           accountQueueStartedAt = undefined
           accountQueueLastCheckAt = undefined
@@ -943,11 +944,13 @@ export class QoderAdapter extends LlmAdapter {
           throw new LlmError(`qoder: ${errorDetail(errorText)}`, 'QUOTA_EXCEEDED', { status: response.status })
         }
 
-        // 非排队：认证失败才续期（且每次请求最多一次，避免刷爆 userinfo）。
+        // 非排队：认证失败才续期（每个账号最多一次，避免刷爆 userinfo）。
         if (!authRefreshed) {
           authRefreshed = true
-          await this.options.refresh()
-          const refreshed = await this.options.resolveCredential(options.model)
+          await this.options.refresh(activeAccountId)
+          const refreshed = activeAccountId !== undefined && this.options.accountPool !== undefined
+            ? await this.options.accountPool.resolveCredentialForAccount(activeAccountId) as QoderCredential | undefined
+            : await this.options.resolveCredential(options.model)
           if (refreshed === undefined || refreshed.access_token.length === 0) {
             throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
           }
@@ -1004,6 +1007,7 @@ export class QoderAdapter extends LlmAdapter {
             if (switched !== undefined) {
               credential = switched.credential
               activeAccountId = switched.accountId
+              authRefreshed = false
               accountQueueAttempts = 0
               accountQueueStartedAt = undefined
               accountQueueLastCheckAt = undefined

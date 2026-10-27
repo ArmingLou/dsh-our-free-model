@@ -439,7 +439,7 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
         return undefined
       }
     },
-    refresh: async () => {
+    refresh: async (accountId?: string) => {
       // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
       //
       // 为什么：resolveCredential（上面）优先从账号池取
@@ -449,7 +449,7 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
       // 那份未更新的过期凭据 → 带着过期 token 发请求 → 401。
       // 用户看到的是「刚在 Channel Pack 登录好，却一直认证失败」，
       // 而日志里续期全是成功的，极难排查。
-      const available = await pool.getAvailableAccount(QODER.id, '')
+      const available = await accountForRefresh(QODER.id, accountId)
       if (available) await qoder.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await qoder.refresh()
     },
@@ -514,12 +514,12 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
         return undefined
       }
     },
-    refresh: async () => {
+    refresh: async (accountId?: string) => {
       // ⚠️ 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
       // 理由与国际版那条真实缺陷完全同因：resolveCredential 优先取池内凭据，
       // 而 refresh() 读写 QODERCN_ACCESS_TOKEN，两者错配会让日志里续期全成功、
       // 用户却「刚登录却一直认证失败」。
-      const available = await pool.getAvailableAccount(QODER_CN.id, '')
+      const available = await accountForRefresh(QODER_CN.id, accountId)
       if (available) await qoderCn.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await qoderCn.refresh()
     },
