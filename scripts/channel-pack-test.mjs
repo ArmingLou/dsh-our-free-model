@@ -493,6 +493,26 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
       assert.deepEqual(quota.switched, [])
       assert.ok(quota.chunks.some(row => row.type === 'text-delta' && row.text === 'quota-rotated-ok'))
 
+      for (const product of [undefined, QODER_CN]) {
+        for (const transport of ['http', 'sse']) {
+          const mixed = await run({
+            kind: 'queue-then-quota', candidates: ['b', 'c'], product,
+            responseForAttempt: (_attempt, token) => {
+              if (token === 'token-a') return transport === 'http'
+                ? Response.json(queueError, { status: 403 }) : queuedSse()
+              if (token === 'token-b') {
+                const billing = { code: 110, message: 'Billing daily count exceeded' }
+                return transport === 'http' ? Response.json(billing, { status: 403 }) : new Response(envelope(billing))
+              }
+              return answerSse('mixed-ok')
+            },
+          })
+          assert.equal(mixed.error, undefined)
+          assert.deepEqual(mixed.sent, ['token-a', 'token-a', 'token-a', 'token-b', 'token-c'])
+          assert.deepEqual(mixed.marked.map(row => row[0]), ['b'], '仅标记真正额度不足的 B')
+        }
+      }
+
       // 用户把等待上限设为 0 时，不能被默认值覆盖，也不应该睡眠或重发。
       const zeroTimeout = await run({
         kind: 'zero-timeout', queueTimeoutMs: '0',

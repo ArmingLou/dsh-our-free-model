@@ -886,6 +886,8 @@ export class QoderAdapter extends LlmAdapter {
         if (switched !== undefined) {
           credential = switched.credential
           queueActiveAccountId = switched.accountId
+          activeAccountId = switched.accountId
+          triedAccounts.add(switched.accountId)
           accountQueueAttempts = 0
           accountQueueStartedAt = undefined
           accountQueueLastCheckAt = undefined
