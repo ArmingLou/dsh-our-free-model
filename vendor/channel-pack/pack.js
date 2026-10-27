@@ -28398,18 +28398,21 @@ function withQueueAccountRotation(provider, options, create, timing = {}) {
       scoped.resolveCredential = async (model) => {
         const request = active();
         if (request?.account !== void 0) {
+          const others = new Set(pool.listAccountsByProvider(provider).filter((account) => account.id !== request.account.entry.id).map((account) => account.id));
           if (options.nextAccount !== void 0) {
-            const others = new Set(pool.listAccountsByProvider(provider).filter((account) => account.id !== request.account.entry.id).map((account) => account.id));
-            const next = await options.nextAccount(request.model, others) ?? await options.nextAccount(request.model, request.tried);
-            if (next === void 0) {
+            const next2 = await options.nextAccount(request.model, others) ?? await options.nextAccount(request.model, request.tried);
+            if (next2 === void 0) {
               throw new LlmError2(`${provider}: \u5F53\u524D\u8D26\u53F7\u4E0D\u53EF\u7528\u6216\u65E0\u6CD5\u786E\u8BA4\u4F59\u989D\uFF0C\u4E14\u6CA1\u6709\u7B26\u5408\u6E20\u9053\u7B56\u7565\u7684\u5907\u7528\u8D26\u53F7`, "QUEUE");
             }
-            const entry = pool.listAccountsByProvider(provider).find((account) => account.id === next.accountId && account.enabled && !((account.modelRateLimits?.[request.model] ?? 0) > Date.now()));
+            const entry = pool.listAccountsByProvider(provider).find((account) => account.id === next2.accountId && account.enabled && !((account.modelRateLimits?.[request.model] ?? 0) > Date.now()));
             if (entry === void 0) throw new LlmError2(`${provider}: \u5F53\u524D\u8BF7\u6C42\u7684\u8D26\u53F7\u5DF2\u79FB\u9664\u3001\u505C\u7528\u6216\u53D7\u9650`, "QUEUE");
-            remember(request, { entry, credential: next.credential });
-            return next.credential;
+            remember(request, { entry, credential: next2.credential });
+            return next2.credential;
           }
-          return pool.resolveCredentialForAccount(request.account.entry.id);
+          const next = await pool.getAvailableAccount(provider, request.model, others) ?? await pool.getAvailableAccount(provider, request.model, request.tried);
+          if (next === null) throw new LlmError2(`${provider}: \u5F53\u524D\u8D26\u53F7\u4E0D\u53EF\u7528\uFF0C\u4E14\u6CA1\u6709\u53EF\u7528\u7684\u5907\u7528\u8D26\u53F7`, "QUEUE");
+          remember(request, next);
+          return next.credential;
         }
         const credential = await options.resolveCredential(model);
         if (request !== void 0 && credential !== null && typeof credential === "object") {
@@ -32079,6 +32082,8 @@ var LobsteraiAdapter = class extends LlmAdapter {
         }
       }
     } finally {
+      await reader.cancel().catch(() => {
+      });
       reader.releaseLock();
     }
     let blockCount = 0;
@@ -33560,6 +33565,8 @@ async function* consumeOpenAiSse(response, options, config) {
       }
     }
   } finally {
+    await reader.cancel().catch(() => {
+    });
     reader.releaseLock();
   }
   let blockCount = 0;
@@ -36075,6 +36082,8 @@ var TraeAdapter = class extends LlmAdapter3 {
         }
       }
     } finally {
+      await reader.cancel().catch(() => {
+      });
       reader.releaseLock();
     }
     if (!sawAnyUpstreamEvent) {
@@ -51901,6 +51910,8 @@ async function* consumeGeminiSse(options) {
       }
     }
   } finally {
+    await reader.cancel().catch(() => {
+    });
     reader.releaseLock?.();
   }
   yield* closeBlock();
@@ -59281,6 +59292,8 @@ async function* consumeMinimaxSse(options) {
       for (const rawLine of lines) yield* processLine(rawLine);
     }
   } finally {
+    await reader.cancel().catch(() => {
+    });
     reader.releaseLock?.();
   }
   if (!sawAnyChunk) {
