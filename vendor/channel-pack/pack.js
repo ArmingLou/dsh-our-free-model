@@ -28398,6 +28398,17 @@ function withQueueAccountRotation(provider, options, create, timing = {}) {
       scoped.resolveCredential = async (model) => {
         const request = active();
         if (request?.account !== void 0) {
+          if (options.nextAccount !== void 0) {
+            const others = new Set(pool.listAccountsByProvider(provider).filter((account) => account.id !== request.account.entry.id).map((account) => account.id));
+            const next = await options.nextAccount(request.model, others) ?? await options.nextAccount(request.model, request.tried);
+            if (next === void 0) {
+              throw new LlmError2(`${provider}: \u5F53\u524D\u8D26\u53F7\u4E0D\u53EF\u7528\u6216\u65E0\u6CD5\u786E\u8BA4\u4F59\u989D\uFF0C\u4E14\u6CA1\u6709\u7B26\u5408\u6E20\u9053\u7B56\u7565\u7684\u5907\u7528\u8D26\u53F7`, "QUEUE");
+            }
+            const entry = pool.listAccountsByProvider(provider).find((account) => account.id === next.accountId && account.enabled && !((account.modelRateLimits?.[request.model] ?? 0) > Date.now()));
+            if (entry === void 0) throw new LlmError2(`${provider}: \u5F53\u524D\u8BF7\u6C42\u7684\u8D26\u53F7\u5DF2\u79FB\u9664\u3001\u505C\u7528\u6216\u53D7\u9650`, "QUEUE");
+            remember(request, { entry, credential: next.credential });
+            return next.credential;
+          }
           return pool.resolveCredentialForAccount(request.account.entry.id);
         }
         const credential = await options.resolveCredential(model);
@@ -34046,6 +34057,7 @@ var QoderAdapter = class extends LlmAdapter2 {
           queueActiveAccountId = switched.accountId;
           activeAccountId = switched.accountId;
           triedAccounts.add(switched.accountId);
+          authRefreshed = false;
           accountQueueAttempts = 0;
           accountQueueStartedAt = void 0;
           accountQueueLastCheckAt = void 0;
@@ -34090,8 +34102,8 @@ var QoderAdapter = class extends LlmAdapter2 {
         }
         if (!authRefreshed) {
           authRefreshed = true;
-          await this.options.refresh();
-          const refreshed = await this.options.resolveCredential(options.model);
+          await this.options.refresh(activeAccountId);
+          const refreshed = activeAccountId !== void 0 && this.options.accountPool !== void 0 ? await this.options.accountPool.resolveCredentialForAccount(activeAccountId) : await this.options.resolveCredential(options.model);
           if (refreshed === void 0 || refreshed.access_token.length === 0) {
             throw new LlmError7("qoder: credential expired and refresh failed", "AUTH", { status: response.status });
           }
@@ -34136,6 +34148,7 @@ var QoderAdapter = class extends LlmAdapter2 {
             if (switched !== void 0) {
               credential = switched.credential;
               activeAccountId = switched.accountId;
+              authRefreshed = false;
               accountQueueAttempts = 0;
               accountQueueStartedAt = void 0;
               accountQueueLastCheckAt = void 0;
@@ -61351,8 +61364,8 @@ function apply(ctx, config = {}) {
         return void 0;
       }
     },
-    refresh: async () => {
-      const available2 = await pool.getAvailableAccount(QODER.id, "");
+    refresh: async (accountId) => {
+      const available2 = await accountForRefresh(QODER.id, accountId);
       if (available2) await qoder.refreshAccountCredential(available2.entry.credentialRef, pool, available2.entry.id);
       else await qoder.refresh();
     },
@@ -61403,8 +61416,8 @@ function apply(ctx, config = {}) {
         return void 0;
       }
     },
-    refresh: async () => {
-      const available2 = await pool.getAvailableAccount(QODER_CN.id, "");
+    refresh: async (accountId) => {
+      const available2 = await accountForRefresh(QODER_CN.id, accountId);
       if (available2) await qoderCn.refreshAccountCredential(available2.entry.credentialRef, pool, available2.entry.id);
       else await qoderCn.refresh();
     },
