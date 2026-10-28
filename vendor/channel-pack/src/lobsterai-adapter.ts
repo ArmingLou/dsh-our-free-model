@@ -307,7 +307,7 @@ export interface LobsteraiAdapterOptions {
   /** 从凭据存储解析凭据。 */
   resolveCredential: (modelId?: string) => Promise<LobsteraiCredential | undefined>
   /** 静默续期凭据。 */
-  refresh: () => Promise<void>
+  refresh: (accountId?: string, reason?: 'auth') => Promise<void>
   /** 动态拉取远端模型列表；失败时回退到 `product.fallbackModels`。 */
   fetchRemoteModels?: () => Promise<LobsteraiRemoteModel[]>
   /** 解析当前客户端版本号（chat 与模型列表都要带）。 */
@@ -998,7 +998,7 @@ export class LobsteraiAdapter extends LlmAdapter {
     // 4. 发送请求（401/403 时刷新一次凭据后重试）
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      await this.options.refresh()
+      await this.options.refresh(undefined, 'auth')
       const refreshed = await this.options.resolveCredential(options.model)
       if (refreshed === undefined || refreshed.access_token.length === 0) {
         throw new LlmError('lobsterai: credential expired and refresh failed', 'AUTH', { status: response.status })

@@ -180,7 +180,7 @@ export interface RaccoonAdapterOptions {
   /** 解析当前可用凭据。 */
   resolveCredential: (modelId?: string) => Promise<RaccoonCredential | undefined>
   /** 凭据失效时的处理（raccoon 有 refresh 端点，会真续期）。 */
-  refresh: (accountId?: string) => Promise<RaccoonCredential | void>
+  refresh: (accountId?: string, reason?: 'auth') => Promise<RaccoonCredential | void>
   /** Request-local rotation; callers must exclude already attempted accounts. */
   nextAccount?: (
     modelId: string,
@@ -484,7 +484,7 @@ export class RaccoonAdapter extends LlmAdapter {
         let response = await send()
         if (response.status === 401 || response.status === 403) {
           await response.body?.cancel()
-          const refreshed = await this.options.refresh(accountId || undefined)
+          const refreshed = await this.options.refresh(accountId || undefined, 'auth')
             ?? await this.options.resolveCredential(options.model)
           if (refreshed === undefined || refreshed.access_token.length === 0) {
             throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status })

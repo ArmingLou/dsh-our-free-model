@@ -44,7 +44,7 @@ import {
   isReachableOpencodeModel,
   type OpencodeErrorInfo, type OpencodeErrorKind, type OpencodeFallbackModel,
 } from './opencode-product.js'
-import { listIdentitySlots, type IdentitySlot } from './opencode-auth.js'
+import { listIdentitySlots, pickSlot, type IdentitySlot } from './opencode-auth.js'
 import { deriveSessionId, opencodeHeaders, opencodeUserAgent } from './opencode.js'
 import { buildOpencodePayloadWithToolMap } from './opencode-messages.js'
 import {
@@ -155,27 +155,6 @@ export interface OpencodeAdapterOptions {
    * 而不是把图片静默丢掉（Qoder 图片丢失事故的教训）。
    */
   readImage?: (ref: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
-}
-
-/**
- * 按「平权」规则选一个可用槽。
- *
- * ⚠️ **收费模型跳过匿名槽**：匿名凭证（字面量 `public`）只被服务端认作
- * 免费通道，送付费模型必然 401/403。
- *
- * @param excluded 已试过的槽 id（`tried` 集合）——保证每个槽最多试一次。
- */
-export function pickSlot(
-  slots: readonly IdentitySlot[],
-  modelId: string,
-  excluded: ReadonlySet<string>,
-): IdentitySlot | undefined {
-  for (const slot of slots) {
-    if (excluded.has(slot.id)) continue
-    if (slot.kind === 'anonymous' && !isFreeOpencodeModel(modelId)) continue
-    return slot
-  }
-  return undefined
 }
 
 /** 限流退避上限：服务端再狠也不让它单次阻塞超过 30 分钟。 */
@@ -676,4 +655,4 @@ export function registerOpencodeLlm(ctx: Context, options: OpencodeAdapterOption
   return adapter
 }
 
-export { listIdentitySlots }
+export { listIdentitySlots, pickSlot }

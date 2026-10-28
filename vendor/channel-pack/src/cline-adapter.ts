@@ -160,7 +160,7 @@ export interface ClineAdapterOptions {
   /** 从凭据存储解析凭据。 */
   resolveCredential: (modelId?: string) => Promise<ClineCredential | undefined>
   /** 静默续期凭据。 */
-  refresh: () => Promise<void>
+  refresh: (accountId?: string, reason?: 'auth') => Promise<void>
   /** 多账号池（用于限流时切换账号与模型黑名单）。 */
   accountPool?: AccountPool
   /**
@@ -613,7 +613,7 @@ export class ClineAdapter extends LlmAdapter {
           { status: response.status },
         )
       }
-      await this.options.refresh()
+      await this.options.refresh(undefined, 'auth')
       const refreshed = await this.options.resolveCredential(options.model)
       if (refreshed === undefined || refreshed.access_token.length === 0) {
         throw new LlmError('cline: credential expired and refresh failed', 'AUTH', { status: response.status })

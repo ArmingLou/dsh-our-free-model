@@ -1,14 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { AccountPool } from './account-pool.js'
-import type { IdentitySlot } from './opencode-auth.js'
+import { pickSlot, type IdentitySlot } from './opencode-auth.js'
 import { ModelQueuedError, QUEUE_MAX_ATTEMPTS, QUEUE_MAX_DELAY_MS } from './model-queue.js'
 import { reportLedgerAccount } from './token-ledger.js'
 
 interface QueueOptions {
   accountPool?: AccountPool
   resolveCredential?: (model?: string) => Promise<unknown>
-  refresh?: (accountId?: string) => Promise<unknown>
+  refresh?: (accountId?: string, reason?: 'auth') => Promise<unknown>
   currentAccountId?: () => string | undefined
   nextAccount?: (model: string, tried: ReadonlySet<string>) => Promise<{ accountId: string; credential: unknown } | undefined>
   identitySlots?: (model?: string) => Promise<readonly IdentitySlot[]>
@@ -20,6 +20,8 @@ interface QueueRequest {
   provider: string
   model: string
   tried: Set<string>
+  credentialRefreshes: Set<string | undefined>
+  authRefreshes: Set<string | undefined>
   account?: Account
   slot?: IdentitySlot
 }
@@ -130,11 +132,21 @@ export function withQueueAccountRotation<O extends QueueOptions, A extends objec
         return credential
       }
     }
-    if (options.refresh !== undefined) {
-      scoped.refresh = accountId => options.refresh!(accountId ?? active()?.account?.entry.id)
-    }
     if (options.currentAccountId !== undefined) {
       scoped.currentAccountId = () => active()?.account?.entry.id ?? options.currentAccountId!()
+    }
+  }
+  if (options.refresh !== undefined) {
+    scoped.refresh = async (accountId, reason) => {
+      const request = active()
+      const id = accountId ?? request?.account?.entry.id
+      if (request !== undefined) {
+        // 初始凭据刷新和服务端认证续期各保留一次，预算跨排队重启并按账号隔离。
+        const budget = reason === 'auth' ? request.authRefreshes : request.credentialRefreshes
+        if (budget.has(id)) throw new LlmError(`${provider}: 当前账号已尝试${reason === 'auth' ? '认证续期' : '凭据刷新'}，停止重复刷新`, 'AUTH')
+        budget.add(id)
+      }
+      return options.refresh!(id, reason)
     }
   }
   if (options.identitySlots !== undefined) {
@@ -150,7 +162,7 @@ export function withQueueAccountRotation<O extends QueueOptions, A extends objec
 
   const stream = async function* (input: unknown, open: () => AsyncIterable<unknown>): AsyncIterable<unknown> {
     const { model, signal } = input as { model: string; signal?: AbortSignal }
-    const request: QueueRequest = { owner: options, provider, model, tried: new Set() }
+    const request: QueueRequest = { owner: options, provider, model, tried: new Set(), credentialRefreshes: new Set(), authRefreshes: new Set() }
     const deadline = now() + 30 * 60_000
     let attempts = 0, queued = 0, since: number | undefined
     let delivered = false
@@ -186,8 +198,8 @@ export function withQueueAccountRotation<O extends QueueOptions, A extends objec
               remember(request, next)
               continue
             }
-          } else if (options.identitySlots !== undefined && request.slot?.kind === 'account') {
-            const next = (await options.identitySlots(model)).find(slot => slot.kind === 'account' && !request.tried.has(slot.id))
+          } else if (options.identitySlots !== undefined && request.slot !== undefined) {
+            const next = pickSlot(await options.identitySlots(model), model, request.tried)
             if (next !== undefined) {
               request.slot = next
               request.tried.add(next.id)

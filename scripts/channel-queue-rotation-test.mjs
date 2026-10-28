@@ -424,5 +424,7 @@ export async function verifyChannelQueueRotation() {
     assert.ok(checked.some(([id, time]) => id === 'a' && time >= 60_000), '沿用真实余额缓存，并在过期后重查')
     console.log(`ok  Loomy queue after balance TTL: locked=${locked}, backup=${addBackup}, unknown=${unknown}`)
   }
+  const { verifyChannelQueuePolicies } = await import('./channel-queue-policy-test.mjs')
+  await verifyChannelQueuePolicies({ makePool, collect, success, sse })
   console.log('ok  channel queue: 9 registered adapters HTTP/SSE, direct/prepared calls, account/model scope, refresh, concurrency, late account, partial output, abort, timeout and identity slots')
 }

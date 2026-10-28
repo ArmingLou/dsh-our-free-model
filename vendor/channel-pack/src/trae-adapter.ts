@@ -222,7 +222,7 @@ export interface TraeAdapterOptions {
    */
   resolveCredential: (modelId?: string) => Promise<TraeCredential | undefined>
   /** 静默续期凭据。 */
-  refresh: () => Promise<void>
+  refresh: (accountId?: string, reason?: 'auth') => Promise<void>
   /** 动态拉取远端模型列表；失败时回退到 `product.fallbackModels`。 */
   fetchRemoteModels?: () => Promise<TraeRemoteModel[]>
   fetchImpl?: typeof fetch
@@ -1050,7 +1050,7 @@ export class TraeAdapter extends LlmAdapter {
     // 4. 发送请求（401/403 时刷新一次凭据后重试）
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      await this.options.refresh()
+      await this.options.refresh(undefined, 'auth')
       // 与主路径一致：按本模型选号（跳过正在限流的账号）。
       const refreshed = await this.options.resolveCredential(options.model)
       if (refreshed === undefined || refreshed.access_token.length === 0) {

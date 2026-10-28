@@ -207,7 +207,7 @@ export interface LoomyAdapterOptions {
    * ⚠️ Loomy **没有 refresh 端点**，故实现只做**有效性探测**并在失效时抛错，
    * 不会（也无法）续期。
    */
-  refresh: (accountId?: string) => Promise<LoomyCredential | void>
+  refresh: (accountId?: string, reason?: 'auth') => Promise<LoomyCredential | void>
   nextAccount?: (
     modelId: string,
     tried: ReadonlySet<string>,
@@ -510,7 +510,7 @@ export class LoomyAdapter extends LlmAdapter {
         let response = await send(credential.access_token)
         if (response.status === 401 || response.status === 403) {
           await response.body?.cancel()
-          credential = await this.options.refresh(accountId || undefined)
+          credential = await this.options.refresh(accountId || undefined, 'auth')
             ?? await this.options.resolveCredential(options.model)
           if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status })
