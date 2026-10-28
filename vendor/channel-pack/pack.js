@@ -27958,27 +27958,47 @@ async function checkQueuedResponse(response) {
   } else if (response.body !== null && response.headers.get("content-type")?.includes("application/json")) {
     const decoder = new TextDecoder();
     let prefix = "";
-    const body = response.body.pipeThrough(new TransformStream({
-      transform(chunk, controller) {
-        if (prefix !== void 0) {
-          prefix += decoder.decode(chunk, { stream: true });
-          if (prefix.length > 65536 || prefix.trimStart().length > 0 && !prefix.trimStart().startsWith("{")) {
-            prefix = void 0;
-          } else {
-            let parsed;
-            try {
-              parsed = JSON.parse(prefix);
-            } catch {
-            }
-            if (parsed !== void 0) {
+    const reader = response.body.getReader();
+    let cancelling;
+    const cancel = (reason) => {
+      cancelling ??= reader.cancel(reason).finally(() => reader.releaseLock());
+      return cancelling;
+    };
+    const body = new ReadableStream({
+      async pull(controller) {
+        try {
+          const { done, value: chunk } = await reader.read();
+          if (cancelling !== void 0) return;
+          if (done) {
+            reader.releaseLock();
+            controller.close();
+            return;
+          }
+          if (prefix !== void 0) {
+            prefix += decoder.decode(chunk, { stream: true });
+            if (prefix.length > 65536 || prefix.trimStart().length > 0 && !prefix.trimStart().startsWith("{")) {
               prefix = void 0;
-              throwIfModelQueued(parsed, response.headers);
+            } else {
+              let parsed;
+              try {
+                parsed = JSON.parse(prefix);
+              } catch {
+              }
+              if (parsed !== void 0) {
+                prefix = void 0;
+                throwIfModelQueued(parsed, response.headers);
+              }
             }
           }
+          controller.enqueue(chunk);
+        } catch (error) {
+          await cancel(error).catch(() => {
+          });
+          controller.error(error);
         }
-        controller.enqueue(chunk);
-      }
-    }));
+      },
+      cancel
+    });
     return new Response(body, response);
   }
   return response;
@@ -33949,9 +33969,10 @@ var QoderAdapter = class extends LlmAdapter2 {
       }
     }
     let initialCredential = await this.options.resolveCredential(options.model);
+    let activeAccountId = initialCredential === void 0 ? void 0 : await this.accountIdForCredential(initialCredential);
     if (initialCredential === void 0 || isQoderExpired(initialCredential)) {
-      await this.options.refresh();
-      initialCredential = await this.options.resolveCredential(options.model);
+      initialCredential = await this.refreshCredential(options.model, activeAccountId);
+      if (activeAccountId === void 0 && initialCredential !== void 0) activeAccountId = await this.accountIdForCredential(initialCredential);
     }
     if (initialCredential === void 0 || initialCredential.access_token.length === 0) {
       throw new LlmError7("qoder: no usable credential; log in first", "MISSING_CREDENTIAL");
@@ -34011,7 +34032,6 @@ var QoderAdapter = class extends LlmAdapter2 {
     let duplicateRetried = false;
     let response;
     const triedAccounts = /* @__PURE__ */ new Set();
-    let activeAccountId = this.options.currentAccountId?.();
     if (activeAccountId !== void 0 && activeAccountId.length > 0) {
       triedAccounts.add(activeAccountId);
     }
@@ -34109,8 +34129,7 @@ var QoderAdapter = class extends LlmAdapter2 {
         }
         if (!authRefreshed) {
           authRefreshed = true;
-          await this.options.refresh(activeAccountId);
-          const refreshed = activeAccountId !== void 0 && this.options.accountPool !== void 0 ? await this.options.accountPool.resolveCredentialForAccount(activeAccountId) : await this.options.resolveCredential(options.model);
+          const refreshed = await this.refreshCredential(options.model, activeAccountId);
           if (refreshed === void 0 || refreshed.access_token.length === 0) {
             throw new LlmError7("qoder: credential expired and refresh failed", "AUTH", { status: response.status });
           }
@@ -34200,6 +34219,13 @@ var QoderAdapter = class extends LlmAdapter2 {
     tried.add(next.entry.id);
     const credential = next.credential;
     return { credential: await this.ensureUid(credential), accountId: next.entry.id };
+  }
+  async accountIdForCredential(credential) {
+    return this.options.queueAccountIdForCredential !== void 0 ? await this.options.queueAccountIdForCredential(credential) : this.options.currentAccountId?.();
+  }
+  async refreshCredential(model, accountId) {
+    await this.options.refresh(accountId);
+    return accountId !== void 0 && this.options.accountPool !== void 0 ? await this.options.accountPool.resolveCredentialForAccount(accountId) : await this.options.resolveCredential(model);
   }
   /** 排队时反查本次凭据所属账号；本地存储短暂失败不能中断请求。 */
   async queueAccountIdForCredential(credential) {
@@ -61394,12 +61420,8 @@ function apply(ctx, config = {}) {
     currentAccountId: () => activeQoderAccountId.get(QODER.id),
     // 以本次实际凭据查账号，避免并发请求间共享的 activeQoderAccountId 串号。
     queueAccountIdForCredential: async (credential) => {
-      try {
-        const id = await pool.findAccountIdByCredential(QODER.id, credential.access_token);
-        return id.length > 0 ? id : void 0;
-      } catch {
-        return void 0;
-      }
+      const id = await pool.findAccountIdByCredential(QODER.id, credential.access_token);
+      return id.length > 0 ? id : void 0;
     },
     onQueueAccountSwitch: () => {
       ctx.logger?.info?.(`[channel-pack] ${QODER.displayName} \u6392\u961F\u65F6\u5DF2\u5C1D\u8BD5\u5207\u6362\u8D26\u53F7`);
@@ -61445,12 +61467,8 @@ function apply(ctx, config = {}) {
     // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
     currentAccountId: () => activeQoderAccountId.get(QODER_CN.id),
     queueAccountIdForCredential: async (credential) => {
-      try {
-        const id = await pool.findAccountIdByCredential(QODER_CN.id, credential.access_token);
-        return id.length > 0 ? id : void 0;
-      } catch {
-        return void 0;
-      }
+      const id = await pool.findAccountIdByCredential(QODER_CN.id, credential.access_token);
+      return id.length > 0 ? id : void 0;
     },
     onQueueAccountSwitch: () => {
       ctx.logger?.info?.(`[channel-pack] ${QODER_CN.displayName} \u6392\u961F\u65F6\u5DF2\u5C1D\u8BD5\u5207\u6362\u8D26\u53F7`);
