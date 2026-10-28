@@ -457,6 +457,22 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
     product: QODER,
     // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
     currentAccountId: () => activeQoderAccountId.get(QODER.id),
+    // 以本次实际凭据查账号，避免并发请求间共享的 activeQoderAccountId 串号。
+    queueAccountIdForCredential: async credential => {
+      try {
+        const id = await pool.findAccountIdByCredential(QODER.id, credential.access_token)
+        return id.length > 0 ? id : undefined
+      } catch {
+        return undefined
+      }
+    },
+    onQueueAccountSwitch: () => {
+      ctx.logger?.info?.(`[channel-pack] ${QODER.displayName} 排队时已尝试切换账号`)
+    },
+    onQueueRotationFailure: reason => {
+      ctx.logger?.warn?.(`[channel-pack] ${QODER.displayName} 排队换号失败，将继续等待并重试`)
+      if (reason !== undefined) ctx.logger?.debug?.(`[channel-pack] ${QODER.id} queue rotation detail: ${String(reason)}`)
+    },
   })
 
   // ===== Qoder 中国版（qodercn）=====
@@ -511,6 +527,21 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
     // ⚠️ 取「**本次实际使用**的账号」而非池里默认那一个：池的默认账号可能与之
     // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
     currentAccountId: () => activeQoderAccountId.get(QODER_CN.id),
+    queueAccountIdForCredential: async credential => {
+      try {
+        const id = await pool.findAccountIdByCredential(QODER_CN.id, credential.access_token)
+        return id.length > 0 ? id : undefined
+      } catch {
+        return undefined
+      }
+    },
+    onQueueAccountSwitch: () => {
+      ctx.logger?.info?.(`[channel-pack] ${QODER_CN.displayName} 排队时已尝试切换账号`)
+    },
+    onQueueRotationFailure: reason => {
+      ctx.logger?.warn?.(`[channel-pack] ${QODER_CN.displayName} 排队换号失败，将继续等待并重试`)
+      if (reason !== undefined) ctx.logger?.debug?.(`[channel-pack] ${QODER_CN.id} queue rotation detail: ${String(reason)}`)
+    },
   })
 
   // ===== TRAE（字节 TRAE IDE）服务 =====
