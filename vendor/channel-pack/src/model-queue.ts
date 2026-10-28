@@ -277,25 +277,45 @@ export async function checkQueuedResponse(response: Response): Promise<Response>
   } else if (response.body !== null && response.headers.get('content-type')?.includes('application/json')) {
     const decoder = new TextDecoder()
     let prefix: string | undefined = ''
-    const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        if (prefix !== undefined) {
-          prefix += decoder.decode(chunk, { stream: true })
-          // shortcut: 只检查开头 64 KiB；上游出现更大的排队错误 JSON 时扩展识别。
-          if (prefix.length > 65_536 || (prefix.trimStart().length > 0 && !prefix.trimStart().startsWith('{'))) {
-            prefix = undefined
-          } else {
-            let parsed: unknown
-            try { parsed = JSON.parse(prefix) } catch { /* JSON 可能跨块，继续读取。 */ }
-            if (parsed !== undefined) {
+    const reader = response.body.getReader()
+    let cancelling: Promise<void> | undefined
+    // 保留源 reader 的取消完成状态，不能依赖已进入错误状态的下游流。
+    const cancel = (reason?: unknown): Promise<void> => {
+      cancelling ??= reader.cancel(reason).finally(() => reader.releaseLock())
+      return cancelling
+    }
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const { done, value: chunk } = await reader.read()
+          if (cancelling !== undefined) return
+          if (done) {
+            reader.releaseLock()
+            controller.close()
+            return
+          }
+          if (prefix !== undefined) {
+            prefix += decoder.decode(chunk, { stream: true })
+            // shortcut: 只检查开头 64 KiB；上游出现更大的排队错误 JSON 时扩展识别。
+            if (prefix.length > 65_536 || (prefix.trimStart().length > 0 && !prefix.trimStart().startsWith('{'))) {
               prefix = undefined
-              throwIfModelQueued(parsed, response.headers)
+            } else {
+              let parsed: unknown
+              try { parsed = JSON.parse(prefix) } catch { /* JSON 可能跨块，继续读取。 */ }
+              if (parsed !== undefined) {
+                prefix = undefined
+                throwIfModelQueued(parsed, response.headers)
+              }
             }
           }
+          controller.enqueue(chunk)
+        } catch (error) {
+          await cancel(error).catch(() => {})
+          controller.error(error)
         }
-        controller.enqueue(chunk)
       },
-    }))
+      cancel,
+    })
     return new Response(body, response)
   }
   return response
