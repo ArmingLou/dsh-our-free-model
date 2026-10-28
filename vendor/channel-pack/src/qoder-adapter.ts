@@ -443,7 +443,7 @@ export interface QoderAdapterOptions {
   /** 从凭据存储解析凭据。 */
   resolveCredential: (modelId?: string) => Promise<QoderCredential | undefined>
   /** 静默续期凭据。 */
-  refresh: () => Promise<void>
+  refresh: (accountId?: string) => Promise<void>
   /** 多账号池（用于限流时切换账号与模型黑名单）。 */
   accountPool?: AccountPool
   /**
@@ -487,7 +487,7 @@ export interface QoderAdapterOptions {
    */
   currentAccountId?: () => string | undefined
   /**
-   * 仅在排队换号时，根据本次请求的凭据反查账号，避免并发请求之间串号。
+   * 根据本次凭据绑定请求账号及排队换号；初始化反查失败时不能回退共享默认账号。
    */
   queueAccountIdForCredential?: (credential: QoderCredential) => string | undefined | Promise<string | undefined>
   /** 排队期间成功切换账号时通知宿主。 */
@@ -704,12 +704,13 @@ export class QoderAdapter extends LlmAdapter {
     }
 
     // 1. 获取凭据（过期则先静默续期）
-    let credential = await this.options.resolveCredential(options.model)
-    if (credential === undefined || isQoderExpired(credential)) {
-      await this.options.refresh()
-      credential = await this.options.resolveCredential(options.model)
+    let initialCredential = await this.options.resolveCredential(options.model)
+    let activeAccountId = initialCredential === undefined ? undefined : await this.accountIdForCredential(initialCredential)
+    if (initialCredential === undefined || isQoderExpired(initialCredential)) {
+      initialCredential = await this.refreshCredential(options.model, activeAccountId)
+      if (activeAccountId === undefined && initialCredential !== undefined) activeAccountId = await this.accountIdForCredential(initialCredential)
     }
-    if (credential === undefined || credential.access_token.length === 0) {
+    if (initialCredential === undefined || initialCredential.access_token.length === 0) {
       throw new LlmError('qoder: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
 
@@ -718,7 +719,7 @@ export class QoderAdapter extends LlmAdapter {
     // ⚠️ `uid` 是后加字段，旧凭据里没有；缺它时 WASM 会产出**签名无效**的
     // 请求，服务端回 `Signature invalid (101)`（真实缺陷，用户报障）。
     // 这里调用注入的钩子补一次（实现会调 userinfo 并回写凭据）。
-    credential = await this.ensureUid(credential)
+    let credential = await this.ensureUid(initialCredential)
 
     // 3. 走**加密推理**路径（客户端真实链路，认模型目录 key）。
     //
@@ -833,7 +834,6 @@ export class QoderAdapter extends LlmAdapter {
      * 下次取号又把 B 选中，于是在 A/B 之间**反复空转**
      *（写单测时实测到了：标记记录是 `['acct-A','acct-A']` 而非 `['acct-A','acct-B']`）。
      */
-    let activeAccountId = this.options.currentAccountId?.()
     if (activeAccountId !== undefined && activeAccountId.length > 0) {
       triedAccounts.add(activeAccountId)
     }
@@ -886,6 +886,9 @@ export class QoderAdapter extends LlmAdapter {
         if (switched !== undefined) {
           credential = switched.credential
           queueActiveAccountId = switched.accountId
+          activeAccountId = switched.accountId
+          triedAccounts.add(switched.accountId)
+          authRefreshed = false
           accountQueueAttempts = 0
           accountQueueStartedAt = undefined
           accountQueueLastCheckAt = undefined
@@ -941,11 +944,10 @@ export class QoderAdapter extends LlmAdapter {
           throw new LlmError(`qoder: ${errorDetail(errorText)}`, 'QUOTA_EXCEEDED', { status: response.status })
         }
 
-        // 非排队：认证失败才续期（且每次请求最多一次，避免刷爆 userinfo）。
+        // 非排队：认证失败才续期（每个账号最多一次，避免刷爆 userinfo）。
         if (!authRefreshed) {
           authRefreshed = true
-          await this.options.refresh()
-          const refreshed = await this.options.resolveCredential(options.model)
+          const refreshed = await this.refreshCredential(options.model, activeAccountId)
           if (refreshed === undefined || refreshed.access_token.length === 0) {
             throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
           }
@@ -1002,6 +1004,7 @@ export class QoderAdapter extends LlmAdapter {
             if (switched !== undefined) {
               credential = switched.credential
               activeAccountId = switched.accountId
+              authRefreshed = false
               accountQueueAttempts = 0
               accountQueueStartedAt = undefined
               accountQueueLastCheckAt = undefined
@@ -1070,6 +1073,19 @@ export class QoderAdapter extends LlmAdapter {
     const credential = next.credential as QoderCredential
     // 切号后必须重新过一遍 uid 补齐（每个账号的 uid 不同）。
     return { credential: await this.ensureUid(credential), accountId: next.entry.id }
+  }
+
+  private async accountIdForCredential(credential: QoderCredential): Promise<string | undefined> {
+    return this.options.queueAccountIdForCredential !== undefined
+      ? await this.options.queueAccountIdForCredential(credential)
+      : this.options.currentAccountId?.()
+  }
+
+  private async refreshCredential(model: string, accountId?: string): Promise<QoderCredential | undefined> {
+    await this.options.refresh(accountId)
+    return accountId !== undefined && this.options.accountPool !== undefined
+      ? await this.options.accountPool.resolveCredentialForAccount(accountId) as QoderCredential | undefined
+      : await this.options.resolveCredential(model)
   }
 
   /** 排队时反查本次凭据所属账号；本地存储短暂失败不能中断请求。 */

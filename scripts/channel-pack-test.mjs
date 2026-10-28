@@ -190,7 +190,7 @@ try {
   creds.delete('AUTO_LOOMY_FIXTURE')
   console.log(`ok  ${sourceMode ? 'source modules' : 'generated pack'}: 10 providers, no OpenCode registration/warmup, historical data retained, account RPCs refused`)
   if (sourceMode) await verifySourceRegressions({ ctx, adapters, call, creds })
-  await verifyChannelCreditsRpc({ ctx, call, creds })
+  await verifyChannelCreditsRpc({ ctx, call, creds, adapters })
   console.log('ok  实际渠道 RPC：七渠道仅账号池凭据即可查余额，ZCode 账号池回退及缺凭据反馈')
 
   // A failed browser callback must become a terminal, readable poll result.
@@ -315,6 +315,8 @@ try {
 }
 
 async function verifySourceRegressions({ ctx, adapters, call, creds }) {
+  const { verifyChannelQueueRotation } = await import('./channel-queue-rotation-test.mjs')
+  await verifyChannelQueueRotation()
   const { verifyChannelPrFixes } = await import('./channel-pr-fixes-test.mjs')
   await verifyChannelPrFixes()
   await verifyLoopResumeEvents()
@@ -351,7 +353,7 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
     QoderEncryptedInfer.create = async () => ({ prepareInfer: () => ({ url: 'fixture:', headers: {}, body: '{}' }) })
     const run = async ({
       kind, candidates = ['b'], responseForAttempt, abortOnSleep = false,
-      addCandidateAfterLookup = false, product, queueTimeoutMs,
+      addCandidateAfterLookup = false, product, queueTimeoutMs, allowRefresh = false,
     }) => {
       const sent = []
       const lookupSets = []
@@ -360,6 +362,8 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
       const rotationFailures = []
       const providers = []
       const slept = []
+      const refreshed = []
+      let defaultCredential = credential('token-a')
       let nowMs = 1_000
       const controller = new AbortController()
       const accounts = candidates.map(id => ({
@@ -373,8 +377,14 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
       } : undefined
       const adapter = new QoderAdapter({
         credentialRef: 'FIXTURE',
-        resolveCredential: async () => credential('token-a'),
-        refresh: async () => { throw new Error('queue retry must not refresh credentials') },
+        resolveCredential: async () => defaultCredential,
+        refresh: async accountId => {
+          if (!allowRefresh) throw new Error('queue retry must not refresh credentials')
+          const id = accountId ?? 'a'
+          refreshed.push(id)
+          if (id === 'a') defaultCredential = credential('token-a-new')
+          else accounts.find(row => row.entry.id === id).credential = credential(`token-${id}-new`)
+        },
         currentAccountId: () => 'a',
         queueAccountIdForCredential: async current => current.access_token === 'token-a' ? 'a' : undefined,
         onQueueAccountSwitch: () => switched.push('queue-switch'),
@@ -391,6 +401,7 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
             return null
           },
           updateModelRateLimit: async (...args) => marked.push(args),
+          resolveCredentialForAccount: async id => id === 'a' ? defaultCredential : accounts.find(row => row.entry.id === id)?.credential,
         },
         fetchImpl: async () => { throw new Error('overridden sendEncrypted should be used') },
         sleep: async (ms, signal) => {
@@ -419,10 +430,52 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
         if (priorTimeout === undefined) delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
         else process.env.DSH_QODER_QUEUE_TIMEOUT_MS = priorTimeout
       }
-      return { sent, lookupSets, providers, marked, switched, rotationFailures, slept, chunks, error, kind }
+      return { sent, lookupSets, providers, marked, switched, rotationFailures, slept, chunks, error, kind, refreshed }
     }
 
     try {
+      for (const product of [undefined, QODER_CN]) {
+        for (const expiredB of [false, true]) {
+          const creds = new Map(['a', 'b'].map(id => [id, {
+            ...credential(`token-${id}`), ...(expiredB && id === 'b' ? { expire_time: 1 } : {}),
+          }]))
+          let sharedId
+          let sharedReads = 0
+          const bSelected = Promise.withResolvers(), sent = [], refreshed = []
+          const adapter = new QoderAdapter({
+            credentialRef: 'FIXTURE', product,
+            resolveCredential: async model => {
+              const id = model.endsWith('-a') ? 'a' : 'b'
+              sharedId = id
+              if (id === 'a') await bSelected.promise
+              else bSelected.resolve()
+              return creds.get(id)
+            },
+            currentAccountId: () => { sharedReads++; return sharedId },
+            queueAccountIdForCredential: async value => value.access_token.startsWith('token-a') ? 'a' : 'b',
+            refresh: async id => {
+              const target = id ?? 'a'
+              refreshed.push(target)
+              creds.set(target, credential(`token-${target}-new`))
+            },
+            accountPool: { resolveCredentialForAccount: async id => creds.get(id) },
+          })
+          adapter.sendEncrypted = async (request, options) => {
+            sent.push([options.model, request.body])
+            return request.body.endsWith('-new') ? answerSse('bound-ok') : Response.json({ code: 105, message: 'expired' }, { status: 401 })
+          }
+          QoderEncryptedInfer.create = async ({ user }) => ({ prepareInfer: () => ({ url: 'fixture:', headers: {}, body: user.securityOauthToken }) })
+          await Promise.all(['a', 'b'].map(id => collect(adapter.stream({ ...qoderOptions, model: `fixture-${id}` }))))
+          assert.deepEqual(sent.filter(([model]) => model === 'fixture-a').map(([, token]) => token), ['token-a', 'token-a-new'])
+          assert.deepEqual(sent.filter(([model]) => model === 'fixture-b').map(([, token]) => token), expiredB ? ['token-b-new'] : ['token-b', 'token-b-new'])
+          assert.deepEqual(refreshed.sort(), ['a', 'b'], '并发认证与初始过期续期都必须绑定实际账号')
+          adapter.options.queueAccountIdForCredential = async () => { throw new Error('fixture identity lookup failed') }
+          const count = sent.length
+          await assert.rejects(collect(adapter.stream({ ...qoderOptions, model: 'fixture-a' })), /identity lookup failed/)
+          assert.equal(sent.length, count, '身份反查失败不能退回共享账号发送')
+          assert.equal(sharedReads, 0, '已提供凭据反查时，禁止读取共享默认账号')
+        }
+      }
       // HTTP 403 排队：第 3 次排队后换到健康账号；略过缺少 uid 的坏条目，且不误写额度限制。
       const http = await run({
         kind: 'http', candidates: ['broken', 'b'],
@@ -478,6 +531,26 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
       assert.deepEqual(cn.sent, ['token-a', 'token-a', 'token-a', 'token-b'])
       assert.ok(cn.providers.every(provider => provider === QODER_CN.id))
 
+      for (const product of [undefined, QODER_CN]) {
+        const canceled = []
+        let pending = false
+        const opened = await run({
+          kind: 'open-queue', product,
+          responseForAttempt: (_attempt, token) => {
+            assert.equal(pending, false, 'Qoder 重发前必须通过信封转换流取消旧上游')
+            if (token !== 'token-a') return answerSse('open-rotated-ok')
+            pending = true
+            return new Response(new ReadableStream({
+              start(controller) { controller.enqueue(new TextEncoder().encode(envelope(queueError))) },
+              cancel() { pending = false; canceled.push(token) },
+            }))
+          },
+        })
+        assert.equal(opened.error, undefined)
+        assert.deepEqual(opened.sent, ['token-a', 'token-a', 'token-a', 'token-b'])
+        assert.deepEqual(canceled, ['token-a', 'token-a', 'token-a'])
+      }
+
       // 排队换号不能破坏原有额度换号：仍按真实账号标记额度，并重置其重试状态。
       const quota = await run({
         kind: 'quota',
@@ -490,6 +563,58 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
       assert.deepEqual(quota.marked.map(row => row[0]), ['a'])
       assert.deepEqual(quota.switched, [])
       assert.ok(quota.chunks.some(row => row.type === 'text-delta' && row.text === 'quota-rotated-ok'))
+
+      for (const product of [undefined, QODER_CN]) {
+        for (const transport of ['http', 'sse']) {
+          const mixed = await run({
+            kind: 'queue-then-quota', candidates: ['b', 'c'], product,
+            responseForAttempt: (_attempt, token) => {
+              if (token === 'token-a') return transport === 'http'
+                ? Response.json(queueError, { status: 403 }) : queuedSse()
+              if (token === 'token-b') {
+                const billing = { code: 110, message: 'Billing daily count exceeded' }
+                return transport === 'http' ? Response.json(billing, { status: 403 }) : new Response(envelope(billing))
+              }
+              return answerSse('mixed-ok')
+            },
+          })
+          assert.equal(mixed.error, undefined)
+          assert.deepEqual(mixed.sent, ['token-a', 'token-a', 'token-a', 'token-b', 'token-c'])
+          assert.deepEqual(mixed.marked.map(row => row[0]), ['b'], '仅标记真正额度不足的 B')
+        }
+        for (const refreshDefaultFirst of [false, true]) {
+          for (const status of [401, 403]) {
+            const mixed = await run({
+              kind: 'queue-then-auth', candidates: ['b', 'c'], product, allowRefresh: true,
+              responseForAttempt: (attempt, token) => {
+                if ((refreshDefaultFirst && attempt === 1) || token === 'token-b' || token === 'token-c') return Response.json({ code: 105, message: 'expired' }, { status })
+                if (token.startsWith('token-a')) return Response.json(queueError, { status: 403 })
+                if (token === 'token-b-new') {
+                  const billing = { code: 110, message: 'Billing daily count exceeded' }
+                  return status === 401 ? Response.json(billing, { status: 403 }) : new Response(envelope(billing))
+                }
+                return answerSse('auth-and-quota-ok')
+              },
+            })
+            assert.equal(mixed.error, undefined)
+            assert.deepEqual(mixed.sent, refreshDefaultFirst
+              ? ['token-a', 'token-a-new', 'token-a-new', 'token-a-new', 'token-b', 'token-b-new', 'token-c', 'token-c-new']
+              : ['token-a', 'token-a', 'token-a', 'token-b', 'token-b-new', 'token-c', 'token-c-new'])
+            assert.deepEqual(mixed.refreshed, refreshDefaultFirst ? ['a', 'b', 'c'] : ['b', 'c'])
+            assert.deepEqual(mixed.marked.map(row => row[0]), ['b'])
+          }
+        }
+        const denied = await run({
+          kind: 'queue-auth-still-denied', candidates: ['b'], product, allowRefresh: true,
+          responseForAttempt: (_attempt, token) => token === 'token-a'
+            ? Response.json(queueError, { status: 403 })
+            : Response.json({ code: 105, message: 'still expired' }, { status: 401 }),
+        })
+        assert.equal(denied.error?.code, 'AUTH')
+        assert.deepEqual(denied.sent, ['token-a', 'token-a', 'token-a', 'token-b', 'token-b-new'])
+        assert.deepEqual(denied.refreshed, ['b'], '每个账号最多续期一次，不回退默认账号')
+        assert.deepEqual(denied.marked, [])
+      }
 
       // 用户把等待上限设为 0 时，不能被默认值覆盖，也不应该睡眠或重发。
       const zeroTimeout = await run({
