@@ -434,6 +434,48 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
     }
 
     try {
+      for (const product of [undefined, QODER_CN]) {
+        for (const expiredB of [false, true]) {
+          const creds = new Map(['a', 'b'].map(id => [id, {
+            ...credential(`token-${id}`), ...(expiredB && id === 'b' ? { expire_time: 1 } : {}),
+          }]))
+          let sharedId
+          let sharedReads = 0
+          const bSelected = Promise.withResolvers(), sent = [], refreshed = []
+          const adapter = new QoderAdapter({
+            credentialRef: 'FIXTURE', product,
+            resolveCredential: async model => {
+              const id = model.endsWith('-a') ? 'a' : 'b'
+              sharedId = id
+              if (id === 'a') await bSelected.promise
+              else bSelected.resolve()
+              return creds.get(id)
+            },
+            currentAccountId: () => { sharedReads++; return sharedId },
+            queueAccountIdForCredential: async value => value.access_token.startsWith('token-a') ? 'a' : 'b',
+            refresh: async id => {
+              const target = id ?? 'a'
+              refreshed.push(target)
+              creds.set(target, credential(`token-${target}-new`))
+            },
+            accountPool: { resolveCredentialForAccount: async id => creds.get(id) },
+          })
+          adapter.sendEncrypted = async (request, options) => {
+            sent.push([options.model, request.body])
+            return request.body.endsWith('-new') ? answerSse('bound-ok') : Response.json({ code: 105, message: 'expired' }, { status: 401 })
+          }
+          QoderEncryptedInfer.create = async ({ user }) => ({ prepareInfer: () => ({ url: 'fixture:', headers: {}, body: user.securityOauthToken }) })
+          await Promise.all(['a', 'b'].map(id => collect(adapter.stream({ ...qoderOptions, model: `fixture-${id}` }))))
+          assert.deepEqual(sent.filter(([model]) => model === 'fixture-a').map(([, token]) => token), ['token-a', 'token-a-new'])
+          assert.deepEqual(sent.filter(([model]) => model === 'fixture-b').map(([, token]) => token), expiredB ? ['token-b-new'] : ['token-b', 'token-b-new'])
+          assert.deepEqual(refreshed.sort(), ['a', 'b'], '并发认证与初始过期续期都必须绑定实际账号')
+          adapter.options.queueAccountIdForCredential = async () => { throw new Error('fixture identity lookup failed') }
+          const count = sent.length
+          await assert.rejects(collect(adapter.stream({ ...qoderOptions, model: 'fixture-a' })), /identity lookup failed/)
+          assert.equal(sent.length, count, '身份反查失败不能退回共享账号发送')
+          assert.equal(sharedReads, 0, '已提供凭据反查时，禁止读取共享默认账号')
+        }
+      }
       // HTTP 403 排队：第 3 次排队后换到健康账号；略过缺少 uid 的坏条目，且不误写额度限制。
       const http = await run({
         kind: 'http', candidates: ['broken', 'b'],

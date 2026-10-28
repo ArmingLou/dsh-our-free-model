@@ -81,6 +81,12 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds, adapters }) {
         service.refreshAccountCredential = async (...args) => { calls.push(args) }
         await adapters.get(provider).options.refresh(otherId)
         assert.deepEqual(calls, [[otherRef, ctx.accountPool, otherId]], `${provider}: 实际认证续期绑定 B`)
+        const lookup = ctx.accountPool.findAccountIdByCredential
+        try {
+          assert.equal(await adapters.get(provider).options.queueAccountIdForCredential({ access_token: 'fixture-b' }), otherId)
+          ctx.accountPool.findAccountIdByCredential = async () => { throw new Error('fixture strict lookup failed') }
+          await assert.rejects(adapters.get(provider).options.queueAccountIdForCredential({ access_token: 'fixture-b' }), /strict lookup failed/)
+        } finally { ctx.accountPool.findAccountIdByCredential = lookup }
         await assert.rejects(adapters.get(provider).options.refresh('missing-account'), /当前请求的账号已移除/)
         assert.equal(calls.length, 1, '账号删除后不得退回 A 续期')
       } finally {

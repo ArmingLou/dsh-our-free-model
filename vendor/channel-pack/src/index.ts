@@ -465,12 +465,8 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
     currentAccountId: () => activeQoderAccountId.get(QODER.id),
     // 以本次实际凭据查账号，避免并发请求间共享的 activeQoderAccountId 串号。
     queueAccountIdForCredential: async credential => {
-      try {
-        const id = await pool.findAccountIdByCredential(QODER.id, credential.access_token)
-        return id.length > 0 ? id : undefined
-      } catch {
-        return undefined
-      }
+      const id = await pool.findAccountIdByCredential(QODER.id, credential.access_token)
+      return id.length > 0 ? id : undefined
     },
     onQueueAccountSwitch: () => {
       ctx.logger?.info?.(`[channel-pack] ${QODER.displayName} 排队时已尝试切换账号`)
@@ -534,12 +530,8 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
     // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
     currentAccountId: () => activeQoderAccountId.get(QODER_CN.id),
     queueAccountIdForCredential: async credential => {
-      try {
-        const id = await pool.findAccountIdByCredential(QODER_CN.id, credential.access_token)
-        return id.length > 0 ? id : undefined
-      } catch {
-        return undefined
-      }
+      const id = await pool.findAccountIdByCredential(QODER_CN.id, credential.access_token)
+      return id.length > 0 ? id : undefined
     },
     onQueueAccountSwitch: () => {
       ctx.logger?.info?.(`[channel-pack] ${QODER_CN.displayName} 排队时已尝试切换账号`)
