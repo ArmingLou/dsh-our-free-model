@@ -49,8 +49,8 @@
     },
     {
       "path": "package.json",
-      "size": 4637,
-      "sha256": "c661c214ab7c28b401d3ccad5a3cfd1494c219907cdfb1adb668a297b79ccc76"
+      "size": 4661,
+      "sha256": "4027b8b3467624ab96cae1c11c9313b11d0db2e6edc6c35f1a6c51c2878af8b8"
     },
     {
       "path": "src/adapter.js",
@@ -66,6 +66,11 @@
       "path": "src/anthropic.js",
       "size": 37282,
       "sha256": "f45027599e194a10cf56532fff9e13ae756fc03db8fbb58ecc69d5d467bdadb8"
+    },
+    {
+      "path": "src/bun-fetch.js",
+      "size": 7724,
+      "sha256": "07d7f5506edf2458308fdebb10291cb500c2e583e9ff772d45f63d10dce8b9db"
     },
     {
       "path": "src/catalog.js",
@@ -134,8 +139,8 @@
     },
     {
       "path": "src/egress.js",
-      "size": 37453,
-      "sha256": "2a444aea0a59a8dce1cbd85c72e6d1fa97c6a289934018fdaea997edebfd692d"
+      "size": 41845,
+      "sha256": "02ebd6a9dc85e1f78c8fed9bf31d5a4bd4cc86cb7dbbfba2dfea68b2dcf4da66"
     },
     {
       "path": "src/engine-parts/win32-x64.000.part",
@@ -344,8 +349,8 @@
     },
     {
       "path": "src/upstream.js",
-      "size": 27279,
-      "sha256": "4bf9db2c87a49e6ec9b4e81e65dd1e8f8e2046c286eb03c322d3c1896aa9cdca"
+      "size": 28910,
+      "sha256": "94d6b9efe9a118224541aff80a7572fd5646061dc5e894e6df346519b10febd1"
     },
     {
       "path": "src/vault-anchor.js",
