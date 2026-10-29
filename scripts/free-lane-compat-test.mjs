@@ -104,4 +104,71 @@ try {
   for (const s of sockets) s.destroy()
   await new Promise(resolve => proxy.close(resolve))
 }
+
+// A cancelled Bun worker (or relay disposal) must also close the outlet while
+// its handshake is still pending, without waiting for the 10s dial deadline.
+async function waitFor(predicate, message) {
+  const deadline = Date.now() + 1500
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, message)
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+}
+
+async function pendingHandshake(stage, dispose) {
+  const peers = new Set()
+  let reached = false
+  const server = net.createServer(socket => {
+    peers.add(socket)
+    socket.on('error', () => {})
+    socket.once('close', () => peers.delete(socket))
+    let step = 0, buffered = Buffer.alloc(0)
+    socket.on('data', chunk => {
+      buffered = Buffer.concat([buffered, chunk])
+      if (stage === 'http' || stage === 'https') {
+        if (stage === 'https' || buffered.includes('\r\n\r\n')) reached = true
+        return // Stall CONNECT, or TLS before CONNECT for an HTTPS proxy.
+      }
+      if (step === 0 && buffered.length >= 3) {
+        const length = 2 + buffered[1]
+        if (buffered.length < length) return
+        buffered = buffered.subarray(length)
+        if (stage === 'socks-greeting') { reached = true; return }
+        socket.write(Buffer.from([5, stage === 'socks-auth' ? 2 : 0]))
+        step = 1
+      }
+      if (step === 1 && buffered.length > 0) {
+        reached = true // Stall the credentials or CONNECT reply.
+      }
+    })
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  let pendingRelay, client
+  try {
+    const scheme = stage.startsWith('socks-') ? 'socks5h' : stage
+    const credentials = stage === 'socks-auth' ? 'user:password@' : ''
+    pendingRelay = await startEgressRelay({ config: () => ({ mode: 'client', url: `${scheme}://${credentials}127.0.0.1:${server.address().port}` }), dataDir: '.' })
+    client = net.connect(pendingRelay.port, '127.0.0.1')
+    client.on('error', () => {})
+    client.on('data', () => {})
+    await new Promise(resolve => client.once('connect', resolve))
+    const auth = Buffer.from(`ofm:${pendingRelay.key}`).toString('base64')
+    client.write(`CONNECT opencode.ai:443 HTTP/1.1\r\nHost: opencode.ai:443\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`)
+    await waitFor(() => reached, `${stage}: handshake was not reached`)
+    assert.equal(peers.size, 1)
+    if (dispose) await pendingRelay.close()
+    else client.destroy()
+    await waitFor(() => peers.size === 0, `${stage}: pending outlet survived ${dispose ? 'relay disposal' : 'client cancellation'}`)
+    console.log(`PASS pending ${stage}: ${dispose ? 'relay disposal' : 'client cancellation'} closes the outlet promptly`)
+  } finally {
+    client?.destroy()
+    await pendingRelay?.close()
+    for (const socket of peers) socket.destroy()
+    await new Promise(resolve => server.close(resolve))
+  }
+}
+
+for (const stage of ['http', 'https', 'socks-greeting', 'socks-auth', 'socks-connect']) {
+  for (const dispose of [false, true]) await pendingHandshake(stage, dispose)
+}
 console.log('free-lane compatibility tests passed')

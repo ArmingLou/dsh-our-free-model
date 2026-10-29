@@ -380,7 +380,16 @@ function relayConnect(req, client, head) {
   const close = () => { client.destroy(); upstream?.destroy() }
   client.on('error', close)
   client.on('close', () => upstream?.destroy())
-  void openTunnel(new URL('http://opencode.ai:443'), relay.outlet).then(socket => {
+  // CONNECT sockets can remain half-open after the worker sends FIN. Before
+  // piping begins there is no stream handler to finish that half-close.
+  client.once('end', close)
+  // Own the socket from the initial dial, not just after CONNECT/SOCKS/TLS
+  // succeeds: cancellation and relay.close() can happen during any stage.
+  void openTunnel(new URL('http://opencode.ai:443'), relay.outlet, socket => {
+    upstream = socket
+    if (client.destroyed) socket.destroy()
+  }).then(socket => {
+    client.off('end', close)
     upstream = socket
     if (client.destroyed) { socket.destroy(); return }
     socket.on('error', close)
@@ -416,18 +425,18 @@ function failOnce(res, error) {
  * Connect to `upstream` through `outlet` and return a socket ready for plain
  * http framing — already TLS-wrapped when the target is https.
  */
-async function openTunnel(upstream, outlet) {
+async function openTunnel(upstream, outlet, onSocket) {
   const isTls = upstream.protocol === 'https:'
   const host = upstream.hostname
   const port = Number(upstream.port) || (isTls ? 443 : 80)
   let socket
   if (outlet.kind === 'url') {
     const proxy = outlet.url
-    if (proxy.protocol === 'http:' || proxy.protocol === 'https:') socket = await httpConnect(proxy, host, port)
-    else if (proxy.protocol === 'socks5:' || proxy.protocol === 'socks5h:') socket = await socks5Connect(proxy, host, port, proxy.protocol === 'socks5h:')
+    if (proxy.protocol === 'http:' || proxy.protocol === 'https:') socket = await httpConnect(proxy, host, port, onSocket)
+    else if (proxy.protocol === 'socks5:' || proxy.protocol === 'socks5h:') socket = await socks5Connect(proxy, host, port, proxy.protocol === 'socks5h:', onSocket)
     else throw new Error(`unsupported proxy scheme "${proxy.protocol}"`)
   } else {
-    socket = await netConnect(host, port)
+    socket = await netConnect(host, port, onSocket)
   }
   if (!isTls) return socket
   return await withTimeout(new Promise((resolve, reject) => {
@@ -439,30 +448,33 @@ async function openTunnel(upstream, outlet) {
     })
     secured.once('secureConnect', () => resolve(secured))
     secured.once('error', error => { secured.destroy(); reject(error) })
+    onSocket?.(secured)
   }), DIAL_TIMEOUT_MS, 'target TLS handshake', socket)
 }
 
 /** Plain TCP with the dial budget applied. */
-function netConnect(host, port) {
+function netConnect(host, port, onSocket) {
+  const socket = net.connect({ host, port })
   return withTimeout(new Promise((resolve, reject) => {
-    const socket = net.connect({ host, port })
     socket.once('connect', () => resolve(socket))
     socket.once('error', reject)
-  }), DIAL_TIMEOUT_MS, 'tcp connect')
+    onSocket?.(socket)
+  }), DIAL_TIMEOUT_MS, 'tcp connect', socket)
 }
 
 /**
  * HTTP CONNECT through an http(s) proxy — including the local mixed port a
  * managed mihomo opens, which speaks CONNECT like any other proxy.
  */
-async function httpConnect(proxy, targetHost, targetPort) {
-  let socket = await netConnect(proxy.hostname, Number(proxy.port) || (proxy.protocol === 'https:' ? 443 : 80))
+async function httpConnect(proxy, targetHost, targetPort, onSocket) {
+  let socket = await netConnect(proxy.hostname, Number(proxy.port) || (proxy.protocol === 'https:' ? 443 : 80), onSocket)
   try {
     if (proxy.protocol === 'https:') {
       socket = await withTimeout(new Promise((resolve, reject) => {
         const secured = tls.connect({ socket, servername: net.isIP(proxy.hostname) === 0 ? proxy.hostname : undefined })
         secured.once('secureConnect', () => resolve(secured))
         secured.once('error', error => { secured.destroy(); reject(error) })
+        onSocket?.(secured)
       }), DIAL_TIMEOUT_MS, 'proxy TLS handshake', socket)
     }
     const auth = proxy.username === '' ? '' : `Proxy-Authorization: Basic ${Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString('base64')}\r\n`
@@ -491,8 +503,8 @@ async function httpConnect(proxy, targetHost, targetPort) {
  * exit must see the name, not this machine's DNS answer. Plain `socks5`
  * resolves locally first, per the scheme's definition.
  */
-async function socks5Connect(proxy, targetHost, targetPort, resolveAtProxy) {
-  const socket = await netConnect(proxy.hostname, Number(proxy.port) || 1080)
+async function socks5Connect(proxy, targetHost, targetPort, resolveAtProxy, onSocket) {
+  const socket = await netConnect(proxy.hostname, Number(proxy.port) || 1080, onSocket)
   try {
     const withAuth = proxy.username !== ''
     socket.write(Buffer.from(withAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]))
@@ -577,6 +589,7 @@ function encodeAddress(resolved) {
  * past the mark so the caller can push them back with `unshift`.
  */
 function readUntil(socket, timeoutMs, what, matcher) {
+  if (socket.destroyed) return Promise.reject(new Error(`the proxy closed during the ${what}`))
   return withTimeout(new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
@@ -621,8 +634,14 @@ function readUntil(socket, timeoutMs, what, matcher) {
 /** Reject after `ms`, tearing the socket down so nothing leaks half-open. */
 function withTimeout(promise, ms, what, socket) {
   let timer
+  let onClose
   return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
+    promise,
+    new Promise((_, reject) => {
+      onClose = () => reject(new Error(`the socket closed during the ${what}`))
+      if (socket?.destroyed) onClose()
+      else socket?.once('close', onClose)
+    }),
     new Promise((_, reject) => {
       timer = setTimeout(() => {
         socket?.destroy?.()
@@ -630,7 +649,10 @@ function withTimeout(promise, ms, what, socket) {
       }, ms)
       timer.unref?.()
     }),
-  ])
+  ]).finally(() => {
+    clearTimeout(timer)
+    socket?.off('close', onClose)
+  })
 }
 
 /** A free loopback port. Small bind/close race is acceptable — a collision surfaces as a clean startup error, not a corrupt state. */
