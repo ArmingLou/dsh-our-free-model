@@ -337,11 +337,8 @@ window.__ModuleLoader__.load({
         'reload.now': '热重载插件',
         'reload.reloading': '重载中…',
         'reload.done': '插件已热重载（第 {n} 次）。',
-        'reload.refresh': '刷新页面',
         'reload.auto': '文件变化自动热重载',
         'toast.annTitle': '新公告',
-        'toast.updateTitle': '插件可升级',
-        'toast.updateBody': '发现新版本 {latest}（当前 {current}），可到设置页升级。',
         'nav.tab.free': '免费模型',
         'nav.tab.eac': 'EAC 模型',
         'nav.tab.channels': '白嫖模型接入',
@@ -1037,11 +1034,8 @@ window.__ModuleLoader__.load({
         'reload.now': 'Hot-reload plugin',
         'reload.reloading': 'Reloading…',
         'reload.done': 'Plugin hot-reloaded (#{n}).',
-        'reload.refresh': 'Reload page',
         'reload.auto': 'Hot-reload on file change',
         'toast.annTitle': 'New announcement',
-        'toast.updateTitle': 'Plugin update available',
-        'toast.updateBody': 'Version {latest} is out (installed {current}). Upgrade from the settings page.',
         'nav.tab.free': 'Free models',
         'nav.tab.eac': 'EAC models',
         'nav.tab.channels': 'Free channels',
@@ -4478,9 +4472,8 @@ window.__ModuleLoader__.load({
        * clicked Remove and nothing happened". The native dialog is therefore
        * gone, not merely guarded.
        *
-       * `showToast` is the confirm surface: it is already how this plugin
-       * confirms an in-app upgrade (`reload.refresh` runs from its actions),
-       * it renders on every page because its host is `document.body`, and it
+       * `showToast` is the confirm surface: it renders on every page because
+       * its host is `document.body`, and it
        * cannot be suppressed by a dialog-blocking host. Two actions keep both
        * directions visible — Remove commits, Cancel dismisses — and the button
        * itself already reported the click by raising the busy state.
@@ -6688,12 +6681,6 @@ window.__ModuleLoader__.load({
           source.addEventListener('update', event => {
             let data
             try { data = JSON.parse(event.data) } catch { return }
-            osNotify(t('toast.updateTitle'), t('toast.updateBody').replace('{latest}', data.latest ?? '').replace('{current}', data.current ?? ''))
-            showToast({
-              title: t('toast.updateTitle'),
-              body: t('toast.updateBody').replace('{latest}', data.latest ?? '').replace('{current}', data.current ?? ''),
-              tone: 'warn', holdMs: 14000,
-            })
             window.dispatchEvent(new CustomEvent('ofm:update', { detail: data }))
           })
           source.addEventListener('upgraded', event => {
@@ -6715,29 +6702,7 @@ window.__ModuleLoader__.load({
         }
       }, 'our-free-model: push subscription')
 
-      // A hot reload or in-app upgrade swaps this bundle while the page stays
-      // open. The only durable marker across that swap is localStorage, so the
-      // successor announces what happened exactly once.
-      ctx.effect(() => {
-        void (async () => {
-          try {
-            const meta = await api('/meta')
-            const at = Number(meta?.reloadedAt ?? 0)
-            if (at <= 0) return
-            let seen = ''
-            try { seen = window.localStorage?.getItem('ofm.reloadedAt') ?? '' } catch { /* storage unavailable */ }
-            if (String(at) === seen) return
-            try { window.localStorage?.setItem('ofm.reloadedAt', String(at)) } catch { /* ignore */ }
-            showToast({
-              title: meta.version !== '' ? `Our Free Model ${meta.version}` : 'Our Free Model',
-              body: t('reload.done').replace('{n}', String(meta.reloadCount ?? 0)),
-              actions: [{ label: t('reload.refresh'), onClick: () => { try { window.location.reload() } catch { /* top-level navigation refused */ } } }],
-              holdMs: 12000,
-            })
-          } catch { /* backend absent */ }
-        })()
-        return () => {}
-      }, 'our-free-model: reload notice')
+
 
       ctx.slots.inject('settings.section', () => ctx.slots.register({
         name: 'settings.section',
