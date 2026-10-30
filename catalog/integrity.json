@@ -349,8 +349,8 @@
     },
     {
       "path": "src/upstream.js",
-      "size": 28910,
-      "sha256": "94d6b9efe9a118224541aff80a7572fd5646061dc5e894e6df346519b10febd1"
+      "size": 30177,
+      "sha256": "9ee28d22e372b0c487a245a633806ce9a6927a2dd4ea242a710b3bcb92f85986"
     },
     {
       "path": "src/vault-anchor.js",
